@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.DS_Store
+
+# local runtime state (never belongs in the repo)
+*.part
+instance.json

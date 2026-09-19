@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>KinoPub Offline</title>
+<link rel="stylesheet" href="/styles.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><text y='26' font-size='26'>🎬</text></svg>">
+</head>
+<body>
+<div id="app">
+  <aside class="sidebar">
+    <div class="brand"><span class="brand-dot"></span><span>KinoPub Offline</span></div>
+    <div id="nav"></div>
+    <div class="nav-foot">Downloads play without internet — see Offline.</div>
+  </aside>
+  <main class="main">
+    <div class="topbar">
+      <div class="search">
+        <span>🔍</span>
+        <input id="search-input" type="search" placeholder="Search films and series…" autocomplete="off">
+      </div>
+      <div class="status-pill" id="status-pill"><span class="dot"></span><span id="status-text">…</span></div>
+    </div>
+    <div class="content" id="view"><div class="spinner"></div></div>
+  </main>
+</div>
+<div id="overlays"></div>
+<!-- hls.js (Apache-2.0), vendored: Chrome plays no HLS natively and exposes
+     no audio-track API, so multi-audio films need it -->
+<script src="/vendor/hls.min.js"></script>
+<script src="/app.js"></script>
+</body>
+</html>
