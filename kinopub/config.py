@@ -21,8 +21,12 @@ POSTER_CACHE = os.path.join(CONFIG_DIR, "posters")
 API_BASE = os.environ.get("KP_API_BASE") or "https://api.service-kp.com"
 
 DEFAULTS = {
-    "client_id": "",
-    "client_secret": "",
+    # The Kodi addon's public client identity, so the app signs in out of the
+    # box. These are an app identifier, not a user secret - your own account
+    # is still what you log into. Replace them in Settings with your own pair
+    # if kino.pub issues you one.
+    "client_id": "xbmc",
+    "client_secret": "cgg3gtifu46urtfp2zp1nqtba0k2ezxh",
     "library_dir": DEFAULT_LIBRARY,
     "preferred_quality": "1080p",
     # HLS by default: this CDN refuses byte ranges deep inside a large mp4,

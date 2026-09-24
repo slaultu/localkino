@@ -16,9 +16,9 @@ cd localkino
 macOS only, and nothing to install: it runs on the python3 that ships with the
 system. `ffmpeg` is needed for downloads (`brew install ffmpeg`).
 
-You need your own kino.pub `client_id` / `client_secret` — ask kino.pub support
-for a pair. Without them you can still try everything against the bundled mock
-(see below).
+A working `client_id` / `client_secret` pair is built in, so you can sign in to
+your kino.pub account straight away. If kino.pub issues you your own pair, paste
+it in Settings.
 
 ## Running it
 
@@ -52,12 +52,9 @@ Startup problems are logged to `~/Library/Logs/KinoPub Offline.log`.
 
 ## First run
 
-1. Settings opens first — enter your `client_id` and `client_secret`.
-   These are issued by kino.pub support (support@kino.pub); it is a standard
-   OAuth 2.0 device flow.
-2. Press **Save**, then **Sign in**.
-3. The app shows a code like `ASDFGH` — open `kino.pub/device` and enter it.
-4. Once you confirm, the app picks up the token by itself and opens the catalog.
+1. Press **Sign in** (a standard OAuth 2.0 device flow).
+2. The app shows a code like `ASDFGH` — open `kino.pub/device` and enter it.
+3. Once you confirm, the app picks up the token by itself and opens the catalog.
 
 Tokens live in `~/.config/kinopub-offline/tokens.json` and refresh automatically
 (access tokens last an hour, refresh tokens 30 days).
@@ -191,7 +188,7 @@ The server listens on `127.0.0.1` only; nothing is exposed to the network.
 
 ## Limitations
 
-- You need your own `client_id` / `client_secret`; the app does not ship with any.
+- The built-in `client_id` / `client_secret` is the Kodi addon's public pair; you can swap in your own in Settings.
 - Audio tracks live inside the video file. Chrome exposes no API for them, so a
   film with several tracks is played through hls.js, which can switch them.
   Downloaded files keep every track - QuickTime or VLC can pick one.

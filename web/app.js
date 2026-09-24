@@ -1589,7 +1589,7 @@ async function viewSettings() {
     el('h1', {}, 'Settings'),
     el('p', { class: 'subtitle' }, 'Stored locally in ~/.config/kinopub-offline'),
     el('div', { class: 'form' },
-      field('client_id', clientId, 'Issued by kino.pub support (support@kino.pub) for the OAuth device flow.'),
+      field('client_id', clientId, 'A working pair is built in, so you can sign in straight away. Replace it if kino.pub issues you your own.'),
       field('client_secret', clientSecret, 'Leave empty to keep the saved value.'),
       field('Download folder', libraryDir, 'Files are saved as: Title (Year)/Title - S01E01 [1080p].mp4'),
       field('Default quality', quality),
