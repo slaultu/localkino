@@ -10,6 +10,7 @@ import mimetypes
 import os
 import posixpath
 import re
+import signal
 import socket
 import subprocess
 import sys
@@ -25,8 +26,23 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from kinopub import api, config, downloader, routes, store  # noqa: E402
 
 WEB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web")
+
+
+def build_id():
+    """The build this process is running (captured when it started)."""
+    return config.BUILD_ID
 mimetypes.add_type("text/javascript", ".js")
 mimetypes.add_type("text/vtt", ".vtt")
+
+
+class QuietServer(ThreadingHTTPServer):
+    """A browser closing a connection mid-request is normal, not a crash."""
+
+    def handle_error(self, request, client_address):
+        error = sys.exc_info()[1]
+        if isinstance(error, (ConnectionResetError, BrokenPipeError)):
+            return
+        super().handle_error(request, client_address)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -280,6 +296,9 @@ def running_instance():
     Two copies sharing one config directory would each keep their own copy of
     library.json and overwrite the other's, and their download schedulers would
     fight over the same .part files - so the second copy defers to the first.
+
+    Unless the first is running older code: after a rebuild you want the new
+    version, so the previous one is stopped and this one takes over.
     """
     data = config.read_json(config.INSTANCE_FILE, {})
     pid, port = data.get("pid"), data.get("port")
@@ -293,9 +312,40 @@ def running_instance():
         request = urllib.request.Request(
             "http://127.0.0.1:%d/api/state" % port, headers={"X-KP-App": "1"})
         with urllib.request.urlopen(request, timeout=1.5) as response:
-            return port if b'"version"' in response.read() else None
+            state = json.loads(response.read().decode("utf-8"))
     except Exception:                       # noqa: BLE001 - not ours, or not answering
         return None
+    if "version" not in state:
+        return None
+    if state.get("build") != build_id():
+        print("  replacing the running copy (older build)", flush=True)
+        _stop_instance(pid, port)
+        return None
+    return port
+
+
+def _stop_instance(pid, port):
+    """Stop the older copy directly with a signal.
+
+    Deliberately not /api/quit: that also asks the desktop app to quit, and the
+    app's quit handler kills whatever pid the instance file names - which by
+    then would be this new server.
+    """
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except OSError:
+        return
+    for _ in range(40):                     # up to ~8s for it to wind down
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            return
+        time.sleep(0.2)
+    try:
+        os.kill(pid, signal.SIGKILL)        # last resort
+    except OSError:
+        pass
+    time.sleep(0.5)
 
 
 def claim_instance(port):
@@ -331,6 +381,11 @@ def main():
 
     config.ensure_dirs()
 
+    def leave(_signum, _frame):
+        raise SystemExit(0)                 # lets the finally block run
+
+    signal.signal(signal.SIGTERM, leave)
+
     already = running_instance()
     if already:
         url = "http://127.0.0.1:%d/" % already
@@ -343,7 +398,7 @@ def main():
     downloader.start()
 
     port = free_port(args.port or int(config.get("port") or 8777))
-    httpd = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    httpd = QuietServer(("127.0.0.1", port), Handler)
     global HTTPD
     HTTPD = httpd
     claim_instance(port)
@@ -353,7 +408,7 @@ def main():
         threading.Timer(0.8, lambda: webbrowser.open(url)).start()
     try:
         httpd.serve_forever()
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, SystemExit):
         print("\nStopping...", flush=True)
         store.flush()
         release_instance()

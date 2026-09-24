@@ -56,6 +56,8 @@ mkdir -p "$APP/Contents/Resources/app"
 cp server.py "$APP/Contents/Resources/app/"
 cp -R kinopub web "$APP/Contents/Resources/app/"
 find "$APP/Contents/Resources/app" -name '__pycache__' -type d -exec rm -rf {} + 2>/dev/null || true
+# stamp the build so a relaunch can tell old code from new
+date -u +"%Y%m%d-%H%M%S" > "$APP/Contents/Resources/app/BUILD"
 cp "$BUILD/icon.icns" "$APP/Contents/Resources/applet.icns"
 
 cat > "$APP/Contents/Resources/start.sh" <<'START'

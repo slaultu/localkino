@@ -211,6 +211,13 @@ function setView(...nodes) {
   window.scrollTo(0, 0);
 }
 
+/** Re-render without yanking the reader back to the top. */
+function setViewKeepingScroll(...nodes) {
+  const top = window.scrollY;
+  setView(...nodes);
+  window.scrollTo(0, top);
+}
+
 function loading() { setView(el('div', { class: 'spinner' })); }
 
 function empty(icon, title, hint, action) {
@@ -240,6 +247,13 @@ const PLACEHOLDER = 'data:image/svg+xml,' + encodeURIComponent(
   '<svg xmlns="http://www.w3.org/2000/svg" width="200" height="300"><rect width="200" height="300" fill="#1d2430"/>' +
   '<text x="100" y="155" font-size="40" text-anchor="middle" fill="#3a4556">🎬</text></svg>');
 
+/* `rating` is kino.pub's own vote tally and `imdb`/`kinopoisk` are database
+   ids - the numbers worth showing are the *_rating fields. */
+function posterScore(item) {
+  const value = Number(item.imdb_rating || item.kinopoisk_rating || 0);
+  return value > 0 && value <= 10 ? value.toFixed(1) : '';
+}
+
 function card(item, options) {
   options = options || {};
   const img = el('img', { src: posterUrl(item) || PLACEHOLDER, loading: 'lazy', alt: item.title || '' });
@@ -250,7 +264,7 @@ function card(item, options) {
     onclick: options.onclick || (() => { location.hash = '#/item/' + item.id; }),
   },
     el('div', { class: 'poster' }, img,
-      item.rating ? el('span', { class: 'chip right' }, '★ ' + Number(item.rating).toFixed(1)) : null,
+      posterScore(item) ? el('span', { class: 'chip right' }, '★ ' + posterScore(item)) : null,
       quality ? el('span', { class: 'chip' }, quality) : null,
       options.badge ? el('span', { class: 'chip dl' }, options.badge) : null,
       options.corner ? el('button', {
@@ -646,6 +660,19 @@ function qualityModal(title, files, onPick) {
 
 /* What the download queue currently says about one video, so the series page
    can show it without you having to go and look at Downloads. */
+/* If it is already on disk, play that copy. Streaming a file you have
+   downloaded wastes bandwidth and can stall on a slow CDN. */
+function playPreferringLocal(build) {
+  return (media) => {
+    const saved = downloadStateFor(media.media_id);
+    if (saved && saved.status === 'done') {
+      playLibraryEntry(saved);
+      return;
+    }
+    openPlayer(build(media));
+  };
+}
+
 function downloadStateFor(mediaId) {
   if (mediaId === null || mediaId === undefined) return null;
   const wanted = String(mediaId);
@@ -676,6 +703,8 @@ async function viewItem(id) {
     const playFirst = () => {
       const media = medias[0];
       if (!media) return toast('No files available', 'err');
+      const saved = downloadStateFor(media.media_id);
+      if (saved && saved.status === 'done') return playLibraryEntry(saved);
       const file = pickFile(media.files, preferred);
       openPlayer({
         url: fileUrl(file, State.settings.stream_type || 'http'),
@@ -725,9 +754,9 @@ async function viewItem(id) {
 
     const facts = [
       item.year && ['Year', item.year],
-      item.rating && ['Rating', Number(item.rating).toFixed(1)],
-      item.imdb && ['IMDb', Number(item.imdb).toFixed(1)],
-      item.kinopoisk && ['Kinopoisk', Number(item.kinopoisk).toFixed(1)],
+      item.rating_percentage && ['kino.pub', item.rating_percentage + '%'],
+      item.imdb_rating && ['IMDb', Number(item.imdb_rating).toFixed(1)],
+      item.kinopoisk_rating && ['Kinopoisk', Number(item.kinopoisk_rating).toFixed(1)],
       (item.duration || {}).average && ['Runtime', duration(item.duration.average)],
       item.quality && ['Quality', qualityLabel(item.quality)],
       (item.countries || []).length && ['Country', item.countries.map((c) => c.title).join(', ')],
@@ -811,17 +840,18 @@ async function viewItem(id) {
 
       const play = el('button', {
         class: 'btn small',
-        onclick: () => openPlayer({
+        title: 'Play',
+        onclick: () => playPreferringLocal((one) => ({
           url: fileUrl(file, State.settings.stream_type || 'http'),
           urls: (file || {}).url || (file || {}).urls || {},
           title: item.title,
-          subtitle: media.season ? `S${media.season}E${media.episode} · ${(file || {}).quality || ''}` : (file || {}).quality || '',
-          itemId: item.id, season: media.season, video: media.episode || media.index || 1,
-          position: (media.watching || {}).time || 0,
-          duration: media.duration,
-          subtitles: chooseSubtitles(media.subtitles),
-          audios: media.audios,
-        }),
+          subtitle: one.season ? `S${one.season}E${one.episode} · ${(file || {}).quality || ''}` : (file || {}).quality || '',
+          itemId: item.id, season: one.season, video: one.episode || one.index || 1,
+          position: (one.watching || {}).time || 0,
+          duration: one.duration,
+          subtitles: chooseSubtitles(one.subtitles),
+          audios: one.audios,
+        }))(media),
       }, '▶︎');
 
       const grab = el('button', {
@@ -989,17 +1019,35 @@ function openPlayer(options) {
     hls = new window.Hls({
       enableWorker: true,
       startFragPrefetch: true,      // fetch the next piece while this one plays
-      maxBufferLength: 60,
+      maxBufferLength: 90,          // ride out a slow patch without stalling
+      maxMaxBufferLength: 180,
       backBufferLength: 30,
-      startPosition: resumeAt || -1,
+      fragLoadingMaxRetry: 6,
+      manifestLoadingMaxRetry: 4,
+      levelLoadingMaxRetry: 4,
+      // 0 means the beginning. Passing -1 lets the playlist decide, which is
+      // how a fresh episode could open partway in.
+      startPosition: resumeAt > 0 ? resumeAt : 0,
     });
     hls.loadSource(url);
     hls.attachMedia(video);
     activeHls = hls;
+
+    let recoveries = 0;
     hls.on(window.Hls.Events.ERROR, (_event, data) => {
-      if (data && data.fatal) {
-        showStall('Playback failed. Try reconnecting, or pick http in Settings.');
+      if (!data || !data.fatal) return;         // hls.js handles the small ones
+      const kinds = window.Hls.ErrorTypes;
+      if (recoveries < 3 && data.type === kinds.NETWORK_ERROR) {
+        recoveries += 1;
+        hls.startLoad();                        // usually just a lost segment
+        return;
       }
+      if (recoveries < 3 && data.type === kinds.MEDIA_ERROR) {
+        recoveries += 1;
+        hls.recoverMediaError();
+        return;
+      }
+      showStall('Playback failed. Try reconnecting, or pick http in Settings.');
     });
     return hls;
   }
@@ -1252,9 +1300,9 @@ function speedPicker(entry) {
 }
 
 function downloadRow(entry) {
-  const percent = Math.round((entry.progress || 0) * 100);
   const img = el('img', { src: entry.poster_file ? '/poster/' + entry.poster_file : PLACEHOLDER, alt: '' });
   img.addEventListener('error', () => { img.src = PLACEHOLDER; });
+
   const action = (name, label, cls, hint) => el('button', {
     class: 'btn small ' + (cls || ''),
     title: hint || '',
@@ -1274,51 +1322,121 @@ function downloadRow(entry) {
     img.addEventListener('click', openItem);
   }
 
-  return el('div', { class: 'dl-row' }, img,
-    el('div', {},
-      el('div', { class: 'dl-name' },
-        openItem
-          ? el('button', { class: 'linklike', type: 'button', onclick: openItem },
-              entry.title + ' ↗')
-          : entry.title),
-      el('div', { class: 'bar ' + (entry.status === 'done' ? 'done' : entry.status === 'error' ? 'err' : '') },
-        el('i', { style: `width:${percent}%` })),
-      el('div', { class: 'dl-meta' },
-        el('span', { class: 'state ' + entry.status }, STATE_LABEL[entry.status] || entry.status),
-        el('span', {}, `${percent}%`),
-        entry.quality ? el('span', {}, entry.quality) : null,
-        entry.total_bytes ? el('span', {}, `${bytes(entry.downloaded_bytes)} / ${bytes(entry.total_bytes)}`) : entry.downloaded_bytes ? el('span', {}, bytes(entry.downloaded_bytes)) : null,
-        entry.status === 'downloading' && entry.speed ? el('span', {}, `${bytes(entry.speed)}/s`) : null,
-        entry.status === 'downloading' && entry.eta ? el('span', {}, '' + eta(entry.eta) + ' left') : null,
-        entry.error ? el('span', { style: 'color:var(--err)' }, entry.error) : null)),
-    el('div', { class: 'dl-actions' },
-      entry.status === 'downloading' || entry.status === 'queued' ? action('pause', '❚❚') : null,
-      entry.status === 'paused' ? action('resume', '▶︎') : null,
-      entry.status === 'error' ? action('retry', '⟳') : null,
-      entry.status !== 'done' ? action('restart', '↻', '', 'Start this download over from zero') : null,
-      entry.status !== 'done' ? speedPicker(entry) : null,
-      entry.status === 'done' ? el('button', {
-        class: 'btn small primary',
-        onclick: () => playLibraryEntry(entry),
-      }, '▶︎') : null,
-      action('delete', '🗑', 'danger')));
+  const name = el('div', { class: 'dl-name' },
+    openItem
+      ? el('button', { class: 'linklike', type: 'button', onclick: openItem }, entry.title + ' ↗')
+      : entry.title);
+  const fill = el('i', {});
+  const bar = el('div', { class: 'bar' }, fill);
+  const meta = el('div', { class: 'dl-meta' });
+  const actions = el('div', { class: 'dl-actions' });
+  const row = el('div', { class: 'dl-row' }, img, el('div', {}, name, bar, meta), actions);
+
+  let shownStatus = null;
+
+  /* Called on every poll. Only the numbers are touched, so the page keeps its
+     scroll position and an open speed dropdown is not torn out mid-choice. */
+  function update(next) {
+    entry = next || entry;
+    const percent = Math.round((entry.progress || 0) * 100);
+    fill.style.width = percent + '%';
+    bar.className = 'bar ' + (entry.status === 'done' ? 'done' : entry.status === 'error' ? 'err' : '');
+
+    meta.textContent = '';
+    [
+      el('span', { class: 'state ' + entry.status }, STATE_LABEL[entry.status] || entry.status),
+      el('span', {}, `${percent}%`),
+      entry.quality ? el('span', {}, entry.quality) : null,
+      entry.total_bytes
+        ? el('span', {}, `${bytes(entry.downloaded_bytes)} / ${bytes(entry.total_bytes)}`)
+        : entry.downloaded_bytes ? el('span', {}, bytes(entry.downloaded_bytes)) : null,
+      entry.status === 'downloading' && entry.speed ? el('span', {}, `${bytes(entry.speed)}/s`) : null,
+      entry.status === 'downloading' && entry.eta ? el('span', {}, '' + eta(entry.eta) + ' left') : null,
+      entry.error ? el('span', { style: 'color:var(--err)' }, entry.error) : null,
+    ].forEach((node) => node && meta.appendChild(node));
+
+    if (entry.status !== shownStatus) {        // buttons only change with status
+      shownStatus = entry.status;
+      actions.textContent = '';
+      [
+        entry.status === 'downloading' || entry.status === 'queued' ? action('pause', '❚❚') : null,
+        entry.status === 'paused' ? action('resume', '▶︎') : null,
+        entry.status === 'error' ? action('retry', '⟳') : null,
+        entry.status !== 'done' ? action('restart', '↻', '', 'Start this download over from zero') : null,
+        entry.status !== 'done' ? speedPicker(entry) : null,
+        entry.status === 'done'
+          ? el('button', { class: 'btn small primary', onclick: () => playLibraryEntry(entry) }, '▶︎')
+          : null,
+        action('delete', '🗑', 'danger'),
+      ].forEach((node) => node && actions.appendChild(node));
+    }
+  }
+
+  update(entry);
+  row.update = update;
+  return row;
 }
 
-function renderDownloads() {
+let downloadRows = new Map();
+let downloadLayout = '';
+
+function downloadsLayoutKey(active, done) {
+  return active.map((e) => e.id).join(',') + '|' + done.map((e) => e.id).join(',');
+}
+
+function renderDownloads(options) {
   const active = State.downloads.filter((e) => e.status !== 'done');
-  const done = State.downloads.filter((e) => e.status === 'done');
-  setView(
+  const done = State.downloads.filter((e) => e.status === 'done').slice(0, 40);
+  const layout = downloadsLayoutKey(active, done);
+
+  /* Nothing appeared or finished, so keep the page exactly as it is and let
+     each row refresh its own numbers - otherwise a poll every two seconds
+     would throw you back to the top of the list mid-scroll. */
+  if (!options || !options.rebuild) {
+    if (layout === downloadLayout && downloadRows.size) {
+      for (const entry of State.downloads) {
+        const row = downloadRows.get(entry.id);
+        if (row) row.update(entry);
+      }
+      const note = $('#free-space-note');
+      if (note) note.textContent = freeSpaceNote();
+      return;
+    }
+  }
+
+  downloadRows = new Map();
+  const build = (entry) => {
+    const row = downloadRow(entry);
+    downloadRows.set(entry.id, row);
+    return row;
+  };
+
+  // arriving on the page starts at the top; a list that changed under you
+  // (something finished) is rebuilt where you were reading
+  const arrivedFresh = !!(options && options.rebuild);
+  const hadRows = !!downloadLayout;
+  downloadLayout = layout;
+  const render = (!arrivedFresh && hadRows) ? setViewKeepingScroll : setView;
+  render(
     el('h1', {}, 'Downloads'),
-    el('p', { class: 'subtitle' },
-      `Folder: ${State.settings.library_dir || ''}` +
-      (State.freeSpace ? ` · ${bytes(State.freeSpace)} free` : '')),
+    el('p', { class: 'subtitle', id: 'free-space-note' }, freeSpaceNote()),
     el('div', { class: 'actions', style: 'margin-top:0' }, revealButton(null, '📂 Open folder')),
-    active.length ? el('div', {}, active.map(downloadRow)) : empty('✅', 'No active downloads',
+    active.length ? el('div', {}, active.map(build)) : empty('✅', 'No active downloads',
       'Open a film and press Download.'),
-    done.length ? el('div', {}, el('h2', {}, 'Completed'), done.slice(0, 40).map(downloadRow)) : null);
+    done.length ? el('div', {}, el('h2', {}, 'Completed'), done.map(build)) : null);
 }
 
-function viewDownloads() { renderDownloads(); refreshDownloads(); }
+function freeSpaceNote() {
+  return `Folder: ${State.settings.library_dir || ''}`
+    + (State.freeSpace ? ` · ${bytes(State.freeSpace)} free` : '');
+}
+
+function viewDownloads() {
+  downloadLayout = '';                 // arriving fresh: full render, top of page
+  downloadRows = new Map();
+  renderDownloads({ rebuild: true });
+  refreshDownloads();
+}
 
 /* ----------------------------------------------------------------- library */
 function playLibraryEntry(entry) {

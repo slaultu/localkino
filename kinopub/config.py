@@ -36,6 +36,22 @@ DEFAULTS = {
     "port": 8777,
 }
 
+def _read_build():
+    """The build this process started with.
+
+    Read once at import: a rebuild overwrites the file underneath a running
+    copy, so re-reading it later would make old code claim to be the new build.
+    """
+    marker = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "BUILD")
+    try:
+        with open(marker, encoding="utf-8") as handle:
+            return handle.read().strip() or "dev"
+    except OSError:
+        return "dev"
+
+
+BUILD_ID = _read_build()
+
 _lock = threading.RLock()
 
 

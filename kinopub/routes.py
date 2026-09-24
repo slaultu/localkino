@@ -29,6 +29,7 @@ def state(_params, _body):
         "settings": _public_settings(settings),
         "ffmpeg": bool(downloader.which_ffmpeg()),
         "version": "1.0.0",
+        "build": config.BUILD_ID,
     }
 
 

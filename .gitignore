@@ -5,3 +5,4 @@ __pycache__/
 # local runtime state (never belongs in the repo)
 *.part
 instance.json
+BUILD
