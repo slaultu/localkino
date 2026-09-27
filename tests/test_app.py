@@ -432,3 +432,40 @@ class TestDownloadEndToEnd(ServerTestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+# --------------------------------------------------------------------------- #
+class TestIntegrityCheck(unittest.TestCase):
+    """A download that finished but is damaged must not be called done."""
+
+    def setUp(self):
+        if not downloader.which_ffmpeg():
+            self.skipTest("ffmpeg not available")
+        self.sample = os.path.join(ROOT, "tools", "sample.mp4")
+        self.tmp = tempfile.mkdtemp(prefix="kp-integrity-")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_clean_file_passes(self):
+        errors = downloader.check_integrity(self.sample)
+        self.assertIsNotNone(errors)
+        self.assertLessEqual(errors, downloader.INTEGRITY_ERROR_LIMIT)
+        self.assertFalse(downloader.is_damaged(self.sample))
+
+    def test_corrupted_copy_is_caught(self):
+        broken = os.path.join(self.tmp, "broken.mp4")
+        with open(self.sample, "rb") as src:
+            data = bytearray(src.read())
+        # trash a stretch of the stream well past the header, the way a bad
+        # segment splice does, leaving the container index intact
+        start = len(data) // 2
+        data[start:start + 32 * 1024] = os.urandom(32 * 1024)
+        with open(broken, "wb") as dst:
+            dst.write(data)
+        self.assertTrue(downloader.is_damaged(broken),
+                        "garbage inside the stream went unnoticed")
+
+    def test_missing_file_is_not_a_verdict(self):
+        self.assertIsNone(downloader.check_integrity(os.path.join(self.tmp, "nope.mp4")))
+        self.assertFalse(downloader.is_damaged(os.path.join(self.tmp, "nope.mp4")))

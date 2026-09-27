@@ -665,7 +665,7 @@ function qualityModal(title, files, onPick) {
 function playPreferringLocal(build) {
   return (media) => {
     const saved = downloadStateFor(media.media_id);
-    if (saved && saved.status === 'done') {
+    if (saved && saved.status === 'done' && !saved.damaged) {
       playLibraryEntry(saved);
       return;
     }
@@ -1118,6 +1118,13 @@ function openPlayer(options) {
   video.addEventListener('error', () => {
     const hls = String(options.url).includes('.m3u8');
     if (options.entryId) {
+      const code = (video.error || {}).code;
+      if (code === 3) {                        // MEDIA_ERR_DECODE
+        return toast('This file is damaged and cannot be played. Re-download it: Downloads → ↻', 'err');
+      }
+      if (code === 4) {                        // MEDIA_ERR_SRC_NOT_SUPPORTED
+        return toast('The browser cannot play this format. QuickTime or VLC may.', 'err');
+      }
       return toast('Cannot read the file — it may have been deleted from disk.', 'err');
     }
     if (hls) {
@@ -1473,6 +1480,7 @@ async function viewLibrary() {
       groups.get(key).push(entry);
     }
     const totalSize = entries.reduce((sum, entry) => sum + (entry.total_bytes || 0), 0);
+    const damagedCount = entries.filter((entry) => entry.damaged).length;
     const blocks = [];
     for (const [name, list] of groups) {
       const first = list[0];
@@ -1481,7 +1489,7 @@ async function viewLibrary() {
           id: first.item_id, title: first.title, year: first.year,
           posters: { medium: first.poster_file ? '/poster/' + first.poster_file : '' },
         }, {
-          badge: first.quality,
+          badge: first.damaged ? '⚠ damaged' : first.quality,
           meta: bytes(first.total_bytes),
           progress: first.position && first.duration ? Math.min(first.position / first.duration, 1) : 0,
           onclick: () => (first.season ? showLibraryGroup(name, list) : playLibraryEntry(first)),
@@ -1496,7 +1504,9 @@ async function viewLibrary() {
           id: first.item_id, title: name, year: first.year,
           posters: { medium: first.poster_file ? '/poster/' + first.poster_file : '' },
         }, {
-          badge: `${list.length} ${list.length === 1 ? 'ep' : 'eps'}`,
+          badge: list.some((e) => e.damaged)
+            ? `⚠ ${list.filter((e) => e.damaged).length} damaged`
+            : `${list.length} ${list.length === 1 ? 'ep' : 'eps'}`,
           meta: bytes(list.reduce((sum, e) => sum + (e.total_bytes || 0), 0)),
           onclick: () => showLibraryGroup(name, list),
           corner: first.item_id ? {
@@ -1509,9 +1519,35 @@ async function viewLibrary() {
     }
     setView(el('h1', {}, 'Offline library'),
       el('p', { class: 'subtitle' }, `${entries.length} ${entries.length === 1 ? 'file' : 'files'} · ${bytes(totalSize)} · ${data.library_dir}`),
-      el('div', { class: 'actions', style: 'margin-top:0;margin-bottom:18px' }, revealButton(null, '📂 Open folder')),
+      el('div', { class: 'actions', style: 'margin-top:0;margin-bottom:18px' },
+        revealButton(null, '📂 Open folder'),
+        verifyButton(entries)),
+      damagedCount ? el('div', { class: 'banner err' },
+        `⚠️ ${damagedCount} downloaded ${damagedCount === 1 ? 'file is' : 'files are'} damaged and will not play — open the item and press ↻ to download again.`) : null,
       el('div', { class: 'grid' }, blocks));
   } catch (error) { setView(errorView(error)); }
+}
+
+/** Check every downloaded file parses cleanly; damaged ones get flagged. */
+function verifyButton(entries) {
+  const button = el('button', { class: 'btn small ghost', title: 'Parse every file to find damaged downloads' },
+    '🔍 Verify files');
+  button.addEventListener('click', async () => {
+    try {
+      await local.post('/library/verify');
+      button.disabled = true;
+      const poll = async () => {
+        const data = await local.get('/library/verify');
+        const v = data.verify || {};
+        button.textContent = `🔍 Checking ${v.checked}/${v.total}…`;
+        if (v.running) return setTimeout(poll, 1500);
+        toast(v.damaged ? `${v.damaged} damaged file${v.damaged === 1 ? '' : 's'} found` : 'All files are fine', v.damaged ? 'err' : 'ok');
+        viewLibrary();
+      };
+      poll();
+    } catch (error) { toast(error.message, 'err'); }
+  });
+  return button;
 }
 
 function showLibraryGroup(name, list) {
@@ -1531,13 +1567,26 @@ function showLibraryGroup(name, list) {
 
   const close = () => backdrop.remove();
 
+  const redownload = (entry) => el('button', {
+    class: 'btn small', title: 'Download again from scratch',
+    onclick: async () => {
+      await local.post(`/downloads/${entry.id}/restart`);
+      toast('Downloading again', 'ok');
+      close();
+    },
+  }, '↻');
+
   const savedRow = (entry) => el('div', { class: 'episode' },
     el('span', { class: 'num' }, entry.season ? `${entry.season}×${String(entry.episode).padStart(2, '0')}` : '▶︎'),
     el('span', { class: 'name' }, entry.episode_title || entry.title),
     entry.available === false
       ? el('span', { class: 'dur', style: 'color:var(--err)' }, 'file deleted')
-      : el('span', { class: 'dur dlstate done' }, '✓ saved'),
-    el('button', { class: 'btn small primary', title: 'Play from disk', onclick: () => { close(); playLibraryEntry(entry); } }, '▶︎'),
+      : entry.damaged
+        ? el('span', { class: 'dur', style: 'color:var(--err)' }, '⚠ damaged')
+        : el('span', { class: 'dur dlstate done' }, '✓ saved'),
+    entry.damaged
+      ? redownload(entry)
+      : el('button', { class: 'btn small primary', title: 'Play from disk', onclick: () => { close(); playLibraryEntry(entry); } }, '▶︎'),
     el('button', {
       class: 'btn small danger', title: 'Delete the file',
       onclick: async () => { await local.post(`/downloads/${entry.id}/delete`); close(); viewLibrary(); },
@@ -1580,7 +1629,10 @@ function showLibraryGroup(name, list) {
         media.duration ? el('span', { class: 'dur' }, duration(media.duration)) : null,
         isWatched(media) ? el('span', { class: 'dur', style: 'color:var(--ok)' }, '✓') : null);
 
-      if (saved) {
+      if (saved && saved.damaged) {
+        row.appendChild(el('span', { class: 'dur', style: 'color:var(--err)' }, '⚠ damaged'));
+        row.appendChild(redownload(saved));
+      } else if (saved) {
         row.appendChild(el('span', { class: 'dur dlstate done' }, '✓ saved'));
         row.appendChild(el('button', {
           class: 'btn small primary', title: 'Play from disk',

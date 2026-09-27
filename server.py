@@ -188,6 +188,8 @@ class Handler(BaseHTTPRequestHandler):
             ("POST", "/downloads"): routes.downloads_add,
             ("GET", "/library"): routes.library_list,
             ("POST", "/reveal"): routes.reveal,
+            ("POST", "/library/verify"): routes.library_verify,
+            ("GET", "/library/verify"): routes.library_verify_status,
             ("POST", "/quit"): lambda _p, _b: (shutdown_soon(), {"stopping": True})[1],
         }
         handler = table.get((method, path))

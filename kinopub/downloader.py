@@ -243,8 +243,10 @@ def _hls_download(entry, stop):
     part = os.path.splitext(path)[0] + ".part.mp4"
     os.makedirs(os.path.dirname(path), exist_ok=True)
     duration = float(entry.get("duration") or 0)
+    # Only retry at connect time. `-reconnect`/`-reconnect_streamed` resume a
+    # dropped segment mid-way with a byte range, and this CDN answers those
+    # unreliably - the result was files with garbage spliced into the stream.
     cmd = [ffmpeg, "-y", "-loglevel", "error", "-user_agent", UA,
-           "-reconnect", "1", "-reconnect_streamed", "1",
            "-reconnect_on_network_error", "1", "-reconnect_delay_max", "10"]
     readrate = _readrate_for(entry)
     if readrate:
@@ -510,6 +512,68 @@ def effective_limit_bytes(entry):
     return min(limits) if limits else 0
 
 
+INTEGRITY_ERROR_LIMIT = 50      # clean files report 0; damaged ones tens of thousands
+
+
+def check_integrity(path, timeout=900):
+    """Parse the whole file without decoding; returns the number of error lines.
+
+    None means the check could not run (no ffmpeg, file missing, timed out).
+    Damaged downloads still remux cleanly and look complete, but the parser
+    trips over them constantly - a broken stream produced ~90,000 lines.
+    """
+    ffmpeg = which_ffmpeg()
+    if not ffmpeg or not os.path.exists(path):
+        return None
+    try:
+        proc = subprocess.run(
+            [ffmpeg, "-v", "error", "-i", path, "-c", "copy", "-f", "null", "-"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, timeout=timeout)
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    return sum(1 for line in proc.stderr.splitlines() if line.strip())
+
+
+def is_damaged(path):
+    errors = check_integrity(path)
+    return errors is not None and errors > INTEGRITY_ERROR_LIMIT
+
+
+_verify_state = {"running": False, "checked": 0, "total": 0, "damaged": 0}
+
+
+def verify_library():
+    """Scan every finished download in the background and flag damaged ones."""
+    if _verify_state["running"]:
+        return dict(_verify_state)
+    entries = [e for e in store.all_entries() if e.get("status") == "done"]
+    _verify_state.update({"running": True, "checked": 0, "total": len(entries), "damaged": 0})
+
+    def scan():
+        try:
+            for entry in entries:
+                path = human_path(entry)
+                if not os.path.exists(path):
+                    _verify_state["checked"] += 1
+                    continue
+                store.update(entry["id"], {"verifying": True}, flush=False)
+                damaged = is_damaged(path)
+                if damaged:
+                    _verify_state["damaged"] += 1
+                store.update(entry["id"], {"verifying": False, "damaged": bool(damaged),
+                                           "verified_at": time.time()})
+                _verify_state["checked"] += 1
+        finally:
+            _verify_state["running"] = False
+
+    threading.Thread(target=scan, daemon=True).start()
+    return dict(_verify_state)
+
+
+def verify_status():
+    return dict(_verify_state)
+
+
 def _run_entry(entry_id, control):
     entry = store.get(entry_id)
     if not entry:
@@ -531,11 +595,20 @@ def _run_entry(entry_id, control):
             else:
                 store.update(entry_id, {"status": "paused", "speed": 0})
             return
+        store.update(entry_id, {"error": "Checking the file…", "speed": 0}, flush=False)
+        if is_damaged(human_path(entry)):
+            # keep it out of the library; ↻ throws the file away and refetches
+            store.update(entry_id, {
+                "status": "error", "speed": 0, "progress": 0.0, "attempt": 0, "damaged": True,
+                "error": "The downloaded file is damaged and will not play - press ↻ to download it again.",
+            })
+            return
         subs = []
         if config.get("download_subtitles"):
             subs = download_subtitles(entry, entry.get("pending_subtitles"))
         store.update(entry_id, {
             "status": "done", "speed": 0, "progress": 1.0, "error": None, "attempt": 0,
+            "damaged": False, "verified_at": time.time(),
             "finished_at": time.time(), "subtitles": subs, "pending_subtitles": None,
         })
     except Exception as exc:                       # noqa: BLE001 - surfaced in the UI
@@ -642,7 +715,7 @@ def restart(entry_id):
     store.update(entry_id, {
         "status": "queued", "error": None, "progress": 0.0,
         "downloaded_bytes": 0, "total_bytes": 0, "speed": 0,
-        "attempt": 0, "paused_by_user": False,
+        "attempt": 0, "paused_by_user": False, "damaged": False,
     })
     _wake.set()
     return True

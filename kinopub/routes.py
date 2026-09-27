@@ -255,6 +255,15 @@ def reveal(_params, body):
     return {"ok": True, "path": target}
 
 
+def library_verify(_params, _body):
+    """Kick off (or report on) a background integrity scan of the library."""
+    return {"verify": downloader.verify_library()}
+
+
+def library_verify_status(_params, _body):
+    return {"verify": downloader.verify_status()}
+
+
 def library_progress(entry_id, body):
     entry = store.update(entry_id, {
         "position": float(body.get("position") or 0),
