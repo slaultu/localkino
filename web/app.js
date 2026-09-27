@@ -1484,7 +1484,7 @@ async function viewLibrary() {
           badge: first.quality,
           meta: bytes(first.total_bytes),
           progress: first.position && first.duration ? Math.min(first.position / first.duration, 1) : 0,
-          onclick: () => playLibraryEntry(first),
+          onclick: () => (first.season ? showLibraryGroup(name, list) : playLibraryEntry(first)),
           corner: first.item_id ? {
             label: '↗',
             title: first.season ? 'Open the series — all episodes' : 'Open on kino.pub',
@@ -1516,27 +1516,91 @@ async function viewLibrary() {
 
 function showLibraryGroup(name, list) {
   const itemId = (list.find((entry) => entry.item_id) || {}).item_id;
+  const savedByMedia = new Map(list.map((entry) => [String(entry.media_id), entry]));
+  const body = el('div', { class: 'episodes' });
+  const note = el('p', { class: 'card-meta', style: 'margin:-6px 0 12px' }, '');
   const backdrop = el('div', { class: 'modal-backdrop', onclick: (e) => { if (e.target === backdrop) backdrop.remove(); } },
-    el('div', { class: 'modal' }, el('h3', {}, name),
-      el('p', { class: 'card-meta', style: 'margin:-6px 0 12px' },
-        `${list.length} downloaded${itemId ? ' — open the series for every episode' : ''}`),
-      el('div', { class: 'episodes' }, list.map((entry) =>
-        el('div', { class: 'episode' },
-          el('span', { class: 'num' }, entry.season ? `${entry.season}×${String(entry.episode).padStart(2, '0')}` : '▶︎'),
-          el('span', { class: 'name' }, entry.episode_title || entry.title),
-          entry.available === false ? el('span', { class: 'dur', style: 'color:var(--err)' }, 'file deleted') : null,
-          el('button', { class: 'btn small primary', onclick: () => { backdrop.remove(); playLibraryEntry(entry); } }, '▶︎'),
-          el('button', {
-            class: 'btn small danger',
-            onclick: async () => { await local.post(`/downloads/${entry.id}/delete`); backdrop.remove(); viewLibrary(); },
-          }, '🗑')))),
+    el('div', { class: 'modal' }, el('h3', {}, name), note, body,
       el('div', { class: 'actions' },
         itemId ? el('button', {
-          class: 'btn primary',
+          class: 'btn',
           onclick: () => { backdrop.remove(); location.hash = '#/item/' + itemId; },
-        }, 'All episodes →') : null,
+        }, 'Open series page →') : null,
         el('button', { class: 'btn ghost', onclick: () => backdrop.remove() }, 'Close'))));
   $('#overlays').appendChild(backdrop);
+
+  const close = () => backdrop.remove();
+
+  const savedRow = (entry) => el('div', { class: 'episode' },
+    el('span', { class: 'num' }, entry.season ? `${entry.season}×${String(entry.episode).padStart(2, '0')}` : '▶︎'),
+    el('span', { class: 'name' }, entry.episode_title || entry.title),
+    entry.available === false
+      ? el('span', { class: 'dur', style: 'color:var(--err)' }, 'file deleted')
+      : el('span', { class: 'dur dlstate done' }, '✓ saved'),
+    el('button', { class: 'btn small primary', title: 'Play from disk', onclick: () => { close(); playLibraryEntry(entry); } }, '▶︎'),
+    el('button', {
+      class: 'btn small danger', title: 'Delete the file',
+      onclick: async () => { await local.post(`/downloads/${entry.id}/delete`); close(); viewLibrary(); },
+    }, '🗑'));
+
+  // what we know without the network: the downloaded episodes
+  const renderSavedOnly = () => {
+    body.textContent = '';
+    note.textContent = `${list.length} downloaded`;
+    list.forEach((entry) => body.appendChild(savedRow(entry)));
+  };
+  renderSavedOnly();
+
+  if (!itemId || !navigator.onLine) return;
+
+  // online: the whole series, so the gaps are visible
+  kp('items/' + itemId).then((data) => {
+    const item = data.item || {};
+    const medias = mediaList(item);
+    if (!medias.length) return;
+    const preferred = State.settings.preferred_quality;
+    const isWatched = (media) => Number(media.watched) === 1
+      || Number((media.watching || {}).status) === 1;
+
+    body.textContent = '';
+    const savedCount = medias.filter((m) => savedByMedia.has(String(m.media_id))).length;
+    note.textContent = `${savedCount} of ${medias.length} episodes downloaded`;
+
+    let season = null;
+    for (const media of medias) {
+      if (media.season !== season) {
+        season = media.season;
+        body.appendChild(el('h2', { style: 'margin:14px 0 6px;font-size:15px' }, `Season ${season}`));
+      }
+      const saved = savedByMedia.get(String(media.media_id));
+      const queued = downloadStateFor(media.media_id);
+      const row = el('div', { class: 'episode' + (isWatched(media) ? ' seen' : '') },
+        el('span', { class: 'num' }, `${media.season}×${String(media.episode).padStart(2, '0')}`),
+        el('span', { class: 'name' }, media.title),
+        media.duration ? el('span', { class: 'dur' }, duration(media.duration)) : null,
+        isWatched(media) ? el('span', { class: 'dur', style: 'color:var(--ok)' }, '✓') : null);
+
+      if (saved) {
+        row.appendChild(el('span', { class: 'dur dlstate done' }, '✓ saved'));
+        row.appendChild(el('button', {
+          class: 'btn small primary', title: 'Play from disk',
+          onclick: () => { close(); playLibraryEntry(saved); },
+        }, '▶︎'));
+      } else if (queued && queued.status !== 'done') {
+        row.appendChild(el('span', { class: 'dur dlstate ' + queued.status }, downloadBadgeText(queued)));
+      } else {
+        row.appendChild(el('span', { class: 'dur', style: 'opacity:.6' }, 'not downloaded'));
+        row.appendChild(el('button', {
+          class: 'btn small', title: 'Download',
+          onclick: () => qualityModal(media.title, media.files, (file) => {
+            queueDownload(item, media, file);
+            close();
+          }),
+        }, '⬇︎'));
+      }
+      body.appendChild(row);
+    }
+  }).catch(() => { /* offline or API trouble: the downloaded list stays */ });
 }
 
 /* ---------------------------------------------------------------- settings */
