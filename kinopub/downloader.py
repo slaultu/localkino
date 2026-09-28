@@ -3,6 +3,7 @@ import hashlib
 import os
 import re
 import shutil
+import signal
 import subprocess
 import threading
 import time
@@ -31,6 +32,69 @@ class NotEnoughSpace(Exception):
 
 
 _controls = {}          # entry_id -> {"stop": Event, "reason": str}
+_children = set()       # ffmpeg Popen objects we started
+_children_lock = threading.Lock()
+HLS_STALL_SECONDS = 90  # no growth of the part file for this long = hung on a dead host
+
+
+def _register(proc):
+    with _children_lock:
+        _children.add(proc)
+
+
+def _unregister(proc):
+    with _children_lock:
+        _children.discard(proc)
+
+
+def kill_children():
+    """Stop every ffmpeg we started. Called on shutdown so none outlive the app."""
+    with _children_lock:
+        procs = list(_children)
+    for proc in procs:
+        try:
+            if proc.poll() is None:
+                proc.terminate()
+        except OSError:
+            pass
+    for proc in procs:
+        try:
+            proc.wait(timeout=5)
+        except Exception:                      # noqa: BLE001 - be firm
+            try:
+                proc.kill()
+            except OSError:
+                pass
+
+
+def sweep_orphans():
+    """Kill ffmpeg processes from a previous run that are still writing into the library.
+
+    A crashed or replaced server leaves its ffmpeg children behind; they keep
+    downloading into .part files nobody tracks and eat the bandwidth the live
+    downloads need. Anything writing a .part.mp4 under our library is ours.
+    """
+    library = os.path.realpath(config.get("library_dir"))
+    killed = 0
+    try:
+        out = subprocess.run(["ps", "-axo", "pid=,command="], capture_output=True, text=True, timeout=10).stdout
+    except Exception:                          # noqa: BLE001
+        return 0
+    for line in out.splitlines():
+        parts = line.strip().split(None, 1)
+        if len(parts) < 2 or "ffmpeg" not in parts[1] or ".part.mp4" not in parts[1]:
+            continue
+        if library not in parts[1] and config.get("library_dir") not in parts[1]:
+            continue
+        try:
+            pid = int(parts[0])
+            if pid == os.getpid():
+                continue
+            os.kill(pid, signal.SIGTERM)
+            killed += 1
+        except (ValueError, OSError):
+            pass
+    return killed
 _controls_lock = threading.Lock()
 _wake = threading.Event()
 _started = False
@@ -326,6 +390,7 @@ def _hls_download(entry, stop):
     # dropped segment mid-way with a byte range, and this CDN answers those
     # unreliably - the result was files with garbage spliced into the stream.
     cmd = [ffmpeg, "-y", "-loglevel", "error", "-user_agent", UA,
+           "-rw_timeout", "20000000",          # 20s: a socket that goes quiet errors out
            "-reconnect_on_network_error", "1", "-reconnect_delay_max", "10"]
     readrate = _readrate_for(entry)
     if readrate:
@@ -342,8 +407,30 @@ def _hls_download(entry, stop):
             "-i", source, "-c", "copy", "-bsf:a", "aac_adtstoasc",
             "-movflags", "+faststart", "-progress", "pipe:1", "-nostats", part]
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    _register(proc)
     store.update(entry["id"], {"error": None, "attempt": 0}, flush=False)
     started_at = time.time()
+
+    # ffmpeg blocked on a dead host prints nothing, so the stdout loop below
+    # would wait forever; a side thread watches the part file instead.
+    hung = {"flag": False}
+
+    def watchdog():
+        last_size, last_change = -1, time.time()
+        while proc.poll() is None and not stop.is_set():
+            time.sleep(5)
+            size = os.path.getsize(part) if os.path.exists(part) else 0
+            if size != last_size:
+                last_size, last_change = size, time.time()
+            elif time.time() - last_change > HLS_STALL_SECONDS:
+                hung["flag"] = True
+                try:
+                    proc.terminate()
+                except OSError:
+                    pass
+                return
+
+    threading.Thread(target=watchdog, daemon=True).start()
     try:
         for line in proc.stdout:
             if stop.is_set():
@@ -361,8 +448,14 @@ def _hls_download(entry, stop):
     finally:
         if proc.poll() is None:
             proc.wait()
+        _unregister(proc)
+    if hung["flag"]:
+        raise socket.timeout("no data for %ds - the host went quiet" % HLS_STALL_SECONDS)
     if proc.returncode != 0:
-        raise RuntimeError((proc.stderr.read() or "ffmpeg exited with an error")[:300])
+        # the last line is the real failure; earlier ones are connection chatter
+        lines = [l for l in (proc.stderr.read() or "").splitlines()
+                 if l.strip() and "Cannot reuse HTTP connection" not in l]
+        raise RuntimeError((lines[-1] if lines else "ffmpeg exited with an error")[:300])
     os.replace(part, path)
     try:
         os.remove(os.path.splitext(path)[0] + ".master.m3u8")
@@ -386,6 +479,9 @@ def _is_retryable(exc):
         return False
     if isinstance(exc, TransferTruncated):
         return True
+    if isinstance(exc, RuntimeError) and any(w in str(exc).lower() for w in
+                                             ("timed out", "timeout", "connection", "i/o error", "server returned 5")):
+        return True                            # ffmpeg lost the host mid-file
     if isinstance(exc, urllib.error.HTTPError):
         return exc.code in (408, 429, 500, 502, 503, 504)
     return isinstance(exc, NETWORK_ERRORS)

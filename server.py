@@ -282,6 +282,7 @@ def shutdown_soon():
     def stop():
         time.sleep(0.4)
         store.flush()
+        downloader.kill_children()
         release_instance()
         if HTTPD is not None:
             HTTPD.shutdown()
@@ -397,6 +398,9 @@ def main():
         return
 
     store.all_entries()
+    swept = downloader.sweep_orphans()
+    if swept:
+        print("  stopped %d ffmpeg process(es) left over from an earlier run" % swept, flush=True)
     downloader.start()
 
     port = free_port(args.port or int(config.get("port") or 8777))
@@ -416,6 +420,7 @@ def main():
         release_instance()
         httpd.shutdown()
     finally:
+        downloader.kill_children()
         release_instance()
         print("Stopped.", flush=True)
 
