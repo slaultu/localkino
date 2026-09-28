@@ -994,6 +994,110 @@ function resumeFrom(position, total) {
   return at;
 }
 
+/* Each quality of a title is served from a different CDN host, and any one of
+   them can be dead or crawling while the others are fine. hls.js only ever
+   measures *our* bandwidth, so left to itself it will sit on a dead host.
+   Instead: fetch the master playlist ourselves, time the first bytes of every
+   variant, drop the hosts that do not answer, order the rest best-first, and
+   hand hls.js the trimmed playlist. Every fetch of the master draws new
+   hosts, so when all of them are dead we simply draw again. */
+const HLS_PROBE_BUDGET_MS = 7000;
+const HLS_PROBE_SAMPLE = 64 * 1024;
+const HLS_MASTER_ATTEMPTS = 3;
+const hlsBlobUrls = [];
+
+function parseMasterPlaylist(text, masterUrl) {
+  const lines = text.split('\n').map((line) => line.trim()).filter(Boolean);
+  const header = [];
+  const media = [];
+  const variants = [];
+  for (let i = 0; i < lines.length; i += 1) {
+    const line = lines[i];
+    if (line.startsWith('#EXT-X-STREAM-INF')) {
+      const attrs = line.slice('#EXT-X-STREAM-INF:'.length);
+      const uri = lines[i + 1] || '';
+      i += 1;
+      const bandwidth = Number((attrs.match(/BANDWIDTH=(\d+)/) || [])[1] || 0);
+      const height = Number((attrs.match(/RESOLUTION=\d+x(\d+)/) || [])[1] || 0);
+      const audioGroup = (attrs.match(/AUDIO="([^"]+)"/) || [])[1] || null;
+      variants.push({ attrs, uri: new URL(uri, masterUrl).href, bandwidth, height, audioGroup });
+    } else if (line.startsWith('#EXT-X-MEDIA:')) {
+      const groupId = (line.match(/GROUP-ID="([^"]+)"/) || [])[1] || null;
+      const absolute = line.replace(/URI="([^"]+)"/, (_m, uri) => `URI="${new URL(uri, masterUrl).href}"`);
+      media.push({ line: absolute, groupId });
+    } else if (line.startsWith('#')) {
+      header.push(line);
+    }
+  }
+  return { header, media, variants };
+}
+
+function buildMasterPlaylist(parsed, keep) {
+  const groups = new Set(keep.map((v) => v.audioGroup).filter(Boolean));
+  const out = parsed.header.slice();
+  parsed.media.filter((m) => !m.groupId || groups.has(m.groupId)).forEach((m) => out.push(m.line));
+  keep.forEach((v) => { out.push('#EXT-X-STREAM-INF:' + v.attrs); out.push(v.uri); });
+  return out.join('\n') + '\n';
+}
+
+async function probeVariant(variant) {
+  const started = performance.now();
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), HLS_PROBE_BUDGET_MS);
+  try {
+    const playlist = await (await fetch(variant.uri, { signal: controller.signal })).text();
+    const first = playlist.split('\n').map((l) => l.trim()).find((l) => l && !l.startsWith('#'));
+    if (!first) return { ok: false };
+    const response = await fetch(new URL(first, variant.uri).href, { signal: controller.signal });
+    const reader = response.body.getReader();
+    let got = 0;
+    while (got < HLS_PROBE_SAMPLE) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      got += value.length;
+    }
+    controller.abort();
+    return { ok: got > 0, bytesPerSec: got / Math.max((performance.now() - started) / 1000, 0.05) };
+  } catch (_) {
+    return { ok: false };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function prepareHlsSource(masterUrl) {
+  const untouched = { url: masterUrl, skipped: 0, attempts: 0 };
+  for (let attempt = 1; attempt <= HLS_MASTER_ATTEMPTS; attempt += 1) {
+    let text;
+    try {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 15000);
+      text = await (await fetch(masterUrl, { signal: controller.signal })).text();
+      clearTimeout(timer);
+    } catch (_) {
+      continue;
+    }
+    const parsed = parseMasterPlaylist(text, masterUrl);
+    if (parsed.variants.length < 2) return untouched;
+    const probes = await Promise.all(parsed.variants.map(probeVariant));
+    const healthy = parsed.variants
+      .map((variant, i) => ({ variant, probe: probes[i] }))
+      .filter((x) => x.probe.ok);
+    if (!healthy.length) continue;             // every host we drew is dead: draw again
+    const sustains = (x) => x.probe.bytesPerSec >= (x.variant.bandwidth / 8) * 1.2;
+    healthy.sort((a, b) => {
+      if (sustains(a) !== sustains(b)) return sustains(a) ? -1 : 1;
+      return sustains(a) ? b.variant.bandwidth - a.variant.bandwidth : b.probe.bytesPerSec - a.probe.bytesPerSec;
+    });
+    const playlist = buildMasterPlaylist(parsed, healthy.map((x) => x.variant));
+    const url = URL.createObjectURL(new Blob([playlist], { type: 'application/vnd.apple.mpegurl' }));
+    hlsBlobUrls.push(url);
+    return { url, skipped: parsed.variants.length - healthy.length, attempts: attempt,
+             chosen: healthy[0].variant.height };
+  }
+  return untouched;
+}
+
 function openPlayer(options) {
   const urls = options.urls || {};
   const audios = options.audios || [];
@@ -1022,16 +1126,20 @@ function openPlayer(options) {
       maxBufferLength: 90,          // ride out a slow patch without stalling
       maxMaxBufferLength: 180,
       backBufferLength: 30,
+      manifestLoadingTimeOut: 30000,
+      levelLoadingTimeOut: 20000,
+      fragLoadingTimeOut: 20000,    // a dead host must fail fast so we can move
       fragLoadingMaxRetry: 6,
       manifestLoadingMaxRetry: 4,
       levelLoadingMaxRetry: 4,
+      startLevel: 0,                // the trimmed playlist lists the best host first
       // 0 means the beginning. Passing -1 lets the playlist decide, which is
       // how a fresh episode could open partway in.
       startPosition: resumeAt > 0 ? resumeAt : 0,
     });
-    hls.loadSource(url);
     hls.attachMedia(video);
     activeHls = hls;
+    loadHlsSource(hls, url);
 
     let recoveries = 0;
     hls.on(window.Hls.Events.ERROR, (_event, data) => {
@@ -1039,7 +1147,7 @@ function openPlayer(options) {
       const kinds = window.Hls.ErrorTypes;
       if (recoveries < 3 && data.type === kinds.NETWORK_ERROR) {
         recoveries += 1;
-        hls.startLoad();                        // usually just a lost segment
+        loadHlsSource(hls, url);                // draw new hosts, not the same dead one
         return;
       }
       if (recoveries < 3 && data.type === kinds.MEDIA_ERROR) {
@@ -1050,6 +1158,18 @@ function openPlayer(options) {
       showStall('Playback failed. Try reconnecting, or pick http in Settings.');
     });
     return hls;
+  }
+
+  /* Choose healthy hosts, then hand hls.js the trimmed playlist. */
+  function loadHlsSource(instance, masterUrl) {
+    prepareHlsSource(masterUrl).then((picked) => {
+      if (instance !== activeHls) return;      // player was closed meanwhile
+      instance.loadSource(picked.url);
+      if (picked.skipped) {
+        toast(`Skipped ${picked.skipped} slow server${picked.skipped === 1 ? '' : 's'}`
+          + (picked.chosen ? ` — playing ${picked.chosen}p` : ''), 'ok');
+      }
+    });
   }
 
   if (useHlsJs) {
@@ -1161,8 +1281,7 @@ function openPlayer(options) {
     const at = lastPosition;
     banner.hidden = true;
     if (hls) {
-      hls.loadSource(source);
-      hls.startLoad();
+      loadHlsSource(hls, source);
       video.play().catch(() => {});
       return;
     }
@@ -1183,14 +1302,26 @@ function openPlayer(options) {
     banner.hidden = true;
     if (stallTimer) { clearTimeout(stallTimer); stallTimer = null; }
   };
+  let lastFragmentAt = Date.now();
+  if (hls) {
+    hls.on(window.Hls.Events.FRAG_LOADED, () => { lastFragmentAt = Date.now(); });
+    hls.on(window.Hls.Events.FRAG_LOADING, () => { lastFragmentAt = Date.now(); });
+  }
+  video.addEventListener('progress', () => { lastFragmentAt = Date.now(); });
+
   const armStall = () => {
     if (options.entryId || stallTimer) return;   // local files never stall on network
     stallTimer = setTimeout(() => {
       stallTimer = null;
-      if (!video.paused && video.readyState < 3) {
-        showStall('Stream stalled — the connection may have dropped.');
+      if (video.paused || video.readyState >= 3) return;
+      // data still trickling in: a slow host, not a dead one - say so, keep waiting
+      if (Date.now() - lastFragmentAt < 25000) {
+        showStall('Slow connection — still loading…');
+        armStall();
+        return;
       }
-    }, 8000);
+      showStall('Stream stalled — the connection may have dropped.');
+    }, 12000);
   };
   video.addEventListener('waiting', armStall);
   video.addEventListener('stalled', armStall);
@@ -1237,6 +1368,9 @@ function openPlayer(options) {
 function escClose(event) { if (event.key === 'Escape') closePlayer(); }
 
 function closePlayer() {
+  while (hlsBlobUrls.length) {
+    try { URL.revokeObjectURL(hlsBlobUrls.pop()); } catch (_) { /* ignore */ }
+  }
   if (activeHls) {
     try { activeHls.destroy(); } catch (_) { /* already gone */ }
     activeHls = null;

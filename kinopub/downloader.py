@@ -235,6 +235,85 @@ def _probe_size(entry):
         return 0
 
 
+def _probe_variant(playlist_url, timeout, sample=64 * 1024):
+    """Time the first bytes of a variant's first segment; None if the host is dead."""
+    started = time.time()
+    try:
+        request = urllib.request.Request(playlist_url, headers={"User-Agent": UA})
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            playlist = response.read().decode("utf-8", "replace")
+        first = next((l.strip() for l in playlist.splitlines() if l.strip() and not l.startswith("#")), None)
+        if not first:
+            return None
+        segment = urllib.parse.urljoin(playlist_url, first)
+        request = urllib.request.Request(segment, headers={"User-Agent": UA})
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            got = len(response.read(sample))
+        if not got:
+            return None
+        return got / max(time.time() - started, 0.05)
+    except Exception:                          # noqa: BLE001 - a dead host is the finding
+        return None
+
+
+def choose_hls_master(master_url, attempts=3, probe_timeout=8, fetch=None):
+    """Return the text of a master playlist trimmed to variants whose host answers.
+
+    Each quality is served from a different CDN host and any of them can be
+    dead; ffmpeg would sit on it. Hosts are drawn afresh on every fetch of the
+    master, so when every host is dead we draw again. None means give up and
+    use the original.
+    """
+    fetch = fetch or (lambda u: urllib.request.urlopen(
+        urllib.request.Request(u, headers={"User-Agent": UA}), timeout=20).read().decode("utf-8", "replace"))
+    for _ in range(attempts):
+        try:
+            text = fetch(master_url)
+        except Exception:                      # noqa: BLE001 - try again
+            continue
+        lines = [l.strip() for l in text.splitlines() if l.strip()]
+        header, media, variants = [], [], []
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+            if line.startswith("#EXT-X-STREAM-INF"):
+                attrs = line[len("#EXT-X-STREAM-INF:"):]
+                uri = urllib.parse.urljoin(master_url, lines[i + 1] if i + 1 < len(lines) else "")
+                bandwidth = int((re.search(r"BANDWIDTH=(\d+)", attrs) or [None, 0])[1] or 0)
+                group = (re.search(r'AUDIO="([^"]+)"', attrs) or [None, None])[1]
+                variants.append({"attrs": attrs, "uri": uri, "bandwidth": bandwidth, "group": group})
+                i += 2
+                continue
+            if line.startswith("#EXT-X-MEDIA:"):
+                group = (re.search(r'GROUP-ID="([^"]+)"', line) or [None, None])[1]
+                absolute = re.sub(r'URI="([^"]+)"',
+                                  lambda m: 'URI="%s"' % urllib.parse.urljoin(master_url, m.group(1)), line)
+                media.append((group, absolute))
+            elif line.startswith("#"):
+                header.append(line)
+            i += 1
+        if len(variants) < 2:
+            return None
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=len(variants)) as pool:
+            speeds = list(pool.map(lambda v: _probe_variant(v["uri"], probe_timeout), variants))
+        healthy = [(v, sp) for v, sp in zip(variants, speeds) if sp]
+        if not healthy:
+            continue
+        sustains = lambda v, sp: sp >= (v["bandwidth"] / 8.0) * 1.2  # noqa: E731
+        healthy.sort(key=lambda x: (0 if sustains(*x) else 1,
+                                    -x[0]["bandwidth"] if sustains(*x) else -x[1]))
+        keep = [v for v, _ in healthy]
+        groups = {v["group"] for v in keep if v["group"]}
+        out = list(header)
+        out += [line for group, line in media if not group or group in groups]
+        for v in keep:
+            out.append("#EXT-X-STREAM-INF:" + v["attrs"])
+            out.append(v["uri"])
+        return "\n".join(out) + "\n"
+    return None
+
+
 def _hls_download(entry, stop):
     ffmpeg = which_ffmpeg()
     if not ffmpeg:
@@ -252,7 +331,15 @@ def _hls_download(entry, stop):
     if readrate:
         # ffmpeg paces by playback speed, so a byte cap becomes a multiplier
         cmd += ["-readrate", "%.2f" % readrate]
-    cmd += ["-i", entry["source_url"], "-c", "copy", "-bsf:a", "aac_adtstoasc",
+    # pick hosts that answer before ffmpeg commits to one
+    source = entry["source_url"]
+    trimmed = choose_hls_master(source)
+    if trimmed:
+        source = os.path.splitext(path)[0] + ".master.m3u8"
+        with open(source, "w", encoding="utf-8") as handle:
+            handle.write(trimmed)
+    cmd += ["-protocol_whitelist", "file,http,https,tcp,tls,crypto",
+            "-i", source, "-c", "copy", "-bsf:a", "aac_adtstoasc",
             "-movflags", "+faststart", "-progress", "pipe:1", "-nostats", part]
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     store.update(entry["id"], {"error": None, "attempt": 0}, flush=False)
@@ -277,6 +364,10 @@ def _hls_download(entry, stop):
     if proc.returncode != 0:
         raise RuntimeError((proc.stderr.read() or "ffmpeg exited with an error")[:300])
     os.replace(part, path)
+    try:
+        os.remove(os.path.splitext(path)[0] + ".master.m3u8")
+    except OSError:
+        pass
     size = os.path.getsize(path)
     store.update(entry["id"], {"progress": 1.0, "total_bytes": size, "downloaded_bytes": size, "speed": 0})
     return True
@@ -742,7 +833,7 @@ def _cleanup_files(entry, keep_dir=False):
     except Exception:
         return
     stem = os.path.splitext(path)[0]
-    for candidate in (path, path + ".part", stem + ".part.mp4"):
+    for candidate in (path, path + ".part", stem + ".part.mp4", stem + ".master.m3u8"):
         try:
             if os.path.exists(candidate):
                 os.remove(candidate)

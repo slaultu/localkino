@@ -469,3 +469,49 @@ class TestIntegrityCheck(unittest.TestCase):
     def test_missing_file_is_not_a_verdict(self):
         self.assertIsNone(downloader.check_integrity(os.path.join(self.tmp, "nope.mp4")))
         self.assertFalse(downloader.is_damaged(os.path.join(self.tmp, "nope.mp4")))
+
+
+# --------------------------------------------------------------------------- #
+class TestHlsHostSelection(unittest.TestCase):
+    """A master playlist is trimmed to the variants whose host actually answers."""
+
+    def setUp(self):
+        base = "http://cdn.example/"
+        self.master = "\n".join([
+            "#EXTM3U", "#EXT-X-VERSION:6",
+            '#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="a1080",NAME="rus",URI="a1080/rus.m3u8"',
+            '#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="a720",NAME="rus",URI="a720/rus.m3u8"',
+            '#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="a480",NAME="rus",URI="a480/rus.m3u8"',
+            '#EXT-X-STREAM-INF:BANDWIDTH=4000000,RESOLUTION=1920x800,AUDIO="a1080"', "v1080/index.m3u8",
+            '#EXT-X-STREAM-INF:BANDWIDTH=1800000,RESOLUTION=1280x534,AUDIO="a720"', "v720/index.m3u8",
+            '#EXT-X-STREAM-INF:BANDWIDTH=800000,RESOLUTION=720x300,AUDIO="a480"', "v480/index.m3u8",
+        ]) + "\n"
+        self.url = base + "master.m3u8"
+
+    def _run(self, speeds):
+        """speeds: variant uri fragment -> bytes/sec (None = dead)."""
+        probe = downloader._probe_variant
+        downloader._probe_variant = lambda uri, timeout, sample=0: next(
+            (v for k, v in speeds.items() if k in uri), None)
+        try:
+            return downloader.choose_hls_master(self.url, attempts=1, fetch=lambda _u: self.master)
+        finally:
+            downloader._probe_variant = probe
+
+    def test_dead_host_is_dropped_and_best_healthy_comes_first(self):
+        out = self._run({"v1080": None, "v720": 400 * 1024, "v480": 80 * 1024})
+        self.assertIsNotNone(out)
+        self.assertNotIn("v1080", out)                       # dead host gone
+        self.assertNotIn('GROUP-ID="a1080"', out)            # and its audio group
+        order = [l for l in out.splitlines() if l.endswith("index.m3u8")]
+        self.assertEqual(order[0], "http://cdn.example/v720/index.m3u8")  # 720p can sustain itself
+        self.assertEqual(order[1], "http://cdn.example/v480/index.m3u8")
+        self.assertIn('URI="http://cdn.example/a720/rus.m3u8"', out)      # made absolute
+
+    def test_everything_dead_means_no_verdict(self):
+        self.assertIsNone(self._run({"v1080": None, "v720": None, "v480": None}))
+
+    def test_slow_but_alive_hosts_are_kept_fastest_first(self):
+        out = self._run({"v1080": 30 * 1024, "v720": 45 * 1024, "v480": 40 * 1024})
+        order = [l for l in out.splitlines() if l.endswith("index.m3u8")]
+        self.assertEqual(order[0], "http://cdn.example/v720/index.m3u8")  # nothing sustains: fastest wins
