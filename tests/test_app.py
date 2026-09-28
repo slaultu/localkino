@@ -10,6 +10,7 @@ import json
 import os
 import shutil
 import socket
+import subprocess
 import sys
 import tempfile
 import threading
@@ -515,3 +516,39 @@ class TestHlsHostSelection(unittest.TestCase):
         out = self._run({"v1080": 30 * 1024, "v720": 45 * 1024, "v480": 40 * 1024})
         order = [l for l in out.splitlines() if l.endswith("index.m3u8")]
         self.assertEqual(order[0], "http://cdn.example/v720/index.m3u8")  # nothing sustains: fastest wins
+
+
+# --------------------------------------------------------------------------- #
+class TestHlsCommand(unittest.TestCase):
+    """ffmpeg rejects http-only options when the input is a local playlist."""
+
+    def test_local_playlist_gets_no_http_options(self):
+        cmd = downloader.hls_command("ffmpeg", "/tmp/x.master.m3u8", "/tmp/x.part.mp4", None, local=True)
+        self.assertNotIn("-user_agent", cmd)
+        self.assertNotIn("-reconnect_on_network_error", cmd)
+        self.assertIn("-protocol_whitelist", cmd)
+        self.assertIn("-rw_timeout", cmd)
+
+    def test_remote_playlist_keeps_them(self):
+        cmd = downloader.hls_command("ffmpeg", "https://cdn/x.m3u8", "/tmp/x.part.mp4", 2.5, local=False)
+        self.assertIn("-user_agent", cmd)
+        self.assertIn("-reconnect_on_network_error", cmd)
+        self.assertNotIn("-protocol_whitelist", cmd)
+        self.assertEqual(cmd[cmd.index("-readrate") + 1], "2.50")
+
+    def test_real_ffmpeg_accepts_the_local_form(self):
+        ffmpeg = downloader.which_ffmpeg()
+        if not ffmpeg:
+            self.skipTest("ffmpeg not available")
+        # a local playlist whose only segment is a local file: exercises option
+        # parsing without any network
+        tmp = tempfile.mkdtemp(prefix="kp-hls-")
+        playlist = os.path.join(tmp, "m.m3u8")
+        with open(playlist, "w") as fh:
+            fh.write("#EXTM3U\\n#EXT-X-VERSION:3\\n#EXT-X-TARGETDURATION:10\\n#EXTINF:10,\\n"
+                     + os.path.join(ROOT, "tools", "sample.mp4") + "\\n#EXT-X-ENDLIST\\n")
+        cmd = downloader.hls_command(ffmpeg, playlist, os.path.join(tmp, "out.mp4"), None, local=True)
+        cmd = [a for a in cmd if a not in ("-progress", "pipe:1")]      # not needed here
+        proc = subprocess.run(cmd[:-1] + ["-t", "1", cmd[-1]], capture_output=True, text=True, timeout=60)
+        self.assertNotIn("not found", proc.stderr, proc.stderr)
+        shutil.rmtree(tmp, ignore_errors=True)

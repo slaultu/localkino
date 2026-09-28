@@ -378,6 +378,28 @@ def choose_hls_master(master_url, attempts=3, probe_timeout=8, fetch=None):
     return None
 
 
+def hls_command(ffmpeg, source, part, readrate=None, local=False):
+    """The ffmpeg argv for an HLS download.
+
+    With a *local* trimmed playlist as the input, ffmpeg rejects the http-only
+    options outright ("Option user_agent not found", likewise the reconnect
+    flags) - only -rw_timeout is accepted there. Verified against ffmpeg 6.0.
+    """
+    cmd = [ffmpeg, "-y", "-loglevel", "error",
+           "-rw_timeout", "20000000"]          # 20s: a socket that goes quiet errors out
+    if local:
+        cmd += ["-protocol_whitelist", "file,http,https,tcp,tls,crypto"]
+    else:
+        cmd += ["-user_agent", UA,
+                "-reconnect_on_network_error", "1", "-reconnect_delay_max", "10"]
+    if readrate:
+        # ffmpeg paces by playback speed, so a byte cap becomes a multiplier
+        cmd += ["-readrate", "%.2f" % readrate]
+    cmd += ["-i", source, "-c", "copy", "-bsf:a", "aac_adtstoasc",
+            "-movflags", "+faststart", "-progress", "pipe:1", "-nostats", part]
+    return cmd
+
+
 def _hls_download(entry, stop):
     ffmpeg = which_ffmpeg()
     if not ffmpeg:
@@ -389,23 +411,16 @@ def _hls_download(entry, stop):
     # Only retry at connect time. `-reconnect`/`-reconnect_streamed` resume a
     # dropped segment mid-way with a byte range, and this CDN answers those
     # unreliably - the result was files with garbage spliced into the stream.
-    cmd = [ffmpeg, "-y", "-loglevel", "error", "-user_agent", UA,
-           "-rw_timeout", "20000000",          # 20s: a socket that goes quiet errors out
-           "-reconnect_on_network_error", "1", "-reconnect_delay_max", "10"]
-    readrate = _readrate_for(entry)
-    if readrate:
-        # ffmpeg paces by playback speed, so a byte cap becomes a multiplier
-        cmd += ["-readrate", "%.2f" % readrate]
     # pick hosts that answer before ffmpeg commits to one
     source = entry["source_url"]
     trimmed = choose_hls_master(source)
+    local = False
     if trimmed:
         source = os.path.splitext(path)[0] + ".master.m3u8"
         with open(source, "w", encoding="utf-8") as handle:
             handle.write(trimmed)
-    cmd += ["-protocol_whitelist", "file,http,https,tcp,tls,crypto",
-            "-i", source, "-c", "copy", "-bsf:a", "aac_adtstoasc",
-            "-movflags", "+faststart", "-progress", "pipe:1", "-nostats", part]
+        local = True
+    cmd = hls_command(ffmpeg, source, part, _readrate_for(entry), local)
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     _register(proc)
     store.update(entry["id"], {"error": None, "attempt": 0}, flush=False)
