@@ -255,3 +255,6 @@ select.btn { appearance: none; padding-right: 28px; background-image: linear-gra
   .sidebar .label, .brand span, .nav-foot { display: none; }
   .hero { grid-template-columns: 1fr; }
 }
+
+.inprogress { margin-bottom: 26px; }
+.inprogress h2 { margin-top: 6px; }

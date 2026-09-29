@@ -421,6 +421,20 @@ class TestDownloadEndToEnd(ServerTestCase):
                      for name in files if name.endswith(".part")]
         self.assertEqual(leftovers, [])
 
+    def test_a_single_file_can_be_verified(self):
+        entry = self._wait_for(self._queue(media_id="m4", subtitles=[])["id"])
+        self.assertEqual(entry["status"], "done", entry.get("error"))
+        status, body = http(self.base + "/api/downloads/%s/verify" % entry["id"], method="POST",
+                            headers={self.APP: "1", "Content-Type": "application/json"}, body=b"{}")
+        self.assertEqual(status, 200)
+        result = json.loads(body)
+        if result.get("damaged") is None:           # random bytes are not a video
+            self.assertFalse(result.get("missing"))
+        # a missing entry is a 404, not a crash
+        status, _ = http(self.base + "/api/downloads/ffffffffffff/verify", method="POST",
+                         headers={self.APP: "1", "Content-Type": "application/json"}, body=b"{}")
+        self.assertEqual(status, 404)
+
     def test_a_dead_link_reports_an_error_and_keeps_no_file(self):
         entry = self._wait_for(
             self._queue(media_id="m3", url="http://127.0.0.1:1/missing.mp4",

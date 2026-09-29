@@ -134,8 +134,8 @@ const NAV = [
   { hash: '#/bookmarks', icon: '⭐️', label: 'Bookmarks' },
   { hash: '#/watching', icon: '👁', label: 'Watching' },
   { sep: true },
-  { hash: '#/downloads', icon: '⬇️', label: 'Downloads', badge: () => State.activeDownloads },
-  { hash: '#/library', icon: '✈️', label: 'Offline' },
+  { hash: '#/downloads', icon: '⬇️', label: 'Downloads' },
+  { hash: '#/library', icon: '✈️', label: 'Offline', badge: () => State.activeDownloads },
   { hash: '#/settings', icon: '⚙️', label: 'Settings' },
   { action: 'quit', icon: '⏻', label: 'Shut down' },
 ];
@@ -1405,6 +1405,7 @@ async function refreshDownloads() {
     State.activeDownloads = State.downloads.filter((e) => ['queued', 'downloading', 'paused', 'error'].includes(e.status)).length;
     renderNav();
     if ((location.hash || '').startsWith('#/downloads')) renderDownloads();
+    if ((location.hash || '').startsWith('#/library')) refreshLibraryInPlace();
     if (repaintItemDownloads && (location.hash || '').startsWith('#/item/')) {
       repaintItemDownloads();
     }
@@ -1448,6 +1449,10 @@ function downloadRow(entry) {
     class: 'btn small ' + (cls || ''),
     title: hint || '',
     onclick: async () => {
+      if (name === 'delete' && !await confirmAction('Delete download?',
+        `“${entry.title}”${entry.status === 'done' ? ` (${bytes(entry.total_bytes)})` : ''} will be removed from this Mac.`, 'Delete')) return;
+      if (name === 'restart' && entry.downloaded_bytes && !await confirmAction('Start over?',
+        `What has been downloaded of “${entry.title}” (${bytes(entry.downloaded_bytes)}) is thrown away and it starts from zero.`, 'Start over')) return;
       await local.post(`/downloads/${entry.id}/${name}`);
       if (name === 'restart') toast('Downloading again from the start', 'ok');
       refreshDownloads();
@@ -1596,17 +1601,161 @@ function playLibraryEntry(entry) {
   });
 }
 
-async function viewLibrary() {
-  loading();
+/* Offline is the one place for downloads: what is still coming in, with its
+   controls, and everything already on this Mac, with delete / check /
+   download again. */
+let libraryActiveKey = null;
+let libraryDoneCount = -1;
+let libraryRendering = false;
+
+function refreshLibraryInPlace() {
+  const active = State.downloads.filter((e) => e.status !== 'done');
+  const key = active.map((e) => e.id).join(',');
+  const doneCount = State.downloads.filter((e) => e.status === 'done').length;
+  if (key === libraryActiveKey && doneCount === libraryDoneCount) {
+    active.forEach((entry) => { const row = downloadRows.get(entry.id); if (row) row.update(entry); });
+    return;
+  }
+  viewLibrary({ quiet: true });                  // something started or finished
+}
+
+function confirmAction(title, text, okLabel) {
+  return new Promise((resolve) => {
+    const done = (answer) => { backdrop.remove(); resolve(answer); };
+    const backdrop = el('div', { class: 'modal-backdrop', onclick: (e) => { if (e.target === backdrop) done(false); } },
+      el('div', { class: 'modal' },
+        el('h3', {}, title),
+        el('p', { class: 'plot' }, text),
+        el('div', { class: 'actions' },
+          el('button', { class: 'btn danger', onclick: () => done(true) }, okLabel),
+          el('button', { class: 'btn ghost', onclick: () => done(false) }, 'Cancel'))));
+    $('#overlays').appendChild(backdrop);
+  });
+}
+
+function globalSpeedPicker() {
+  const current = String(Number(State.settings.speed_limit_total_mb || 0));
+  const choices = [['0', 'Speed: no limit'], ['1', 'Speed: 1 MB/s'], ['2', 'Speed: 2 MB/s'],
+    ['5', 'Speed: 5 MB/s'], ['10', 'Speed: 10 MB/s'], ['20', 'Speed: 20 MB/s']];
+  if (!choices.some(([value]) => value === current)) choices.push([current, `Speed: ${current} MB/s`]);
+  return el('select', {
+    class: 'btn small',
+    title: 'Speed limit for all downloads together (each can also have its own)',
+    onchange: async (event) => {
+      try {
+        const result = await local.post('/settings', { speed_limit_total_mb: Number(event.target.value) });
+        State.settings = result.settings;
+        toast(Number(event.target.value) ? `All downloads together: ${event.target.value} MB/s` : 'No overall speed limit', 'ok');
+      } catch (error) { toast(error.message, 'err'); }
+    },
+  }, choices.map(([value, label]) => el('option', { value, selected: value === current }, label)));
+}
+
+/** Check / download again / delete for one file on disk. */
+function savedFileActions(entry, afterChange) {
+  const verify = el('button', {
+    class: 'btn small ghost', title: 'Check the file is intact',
+    onclick: async () => {
+      verify.disabled = true;
+      verify.textContent = '…';
+      try {
+        const result = await local.post(`/downloads/${entry.id}/verify`);
+        if (result.missing) toast('The file is missing from disk', 'err');
+        else if (result.damaged === null) toast('Could not check the file — is ffmpeg installed?', 'err');
+        else {
+          const changed = !!entry.damaged !== !!result.damaged;
+          entry.damaged = result.damaged;
+          toast(result.damaged ? 'Damaged — download it again with ↻' : 'File is intact ✓', result.damaged ? 'err' : 'ok');
+          if (changed && afterChange) afterChange();
+        }
+      } catch (error) { toast(error.message, 'err'); }
+      verify.disabled = false;
+      verify.textContent = '🔍';
+    },
+  }, '🔍');
+
+  const again = el('button', {
+    class: 'btn small', title: 'Delete this file and download it again',
+    onclick: async () => {
+      if (!await confirmAction('Download again?',
+        `“${entry.title}” (${bytes(entry.total_bytes)}) is deleted and fetched again from the start.`, 'Download again')) return;
+      try {
+        await local.post(`/downloads/${entry.id}/restart`);
+        toast('Downloading again — it is in the list above', 'ok');
+        if (afterChange) afterChange();
+        refreshDownloads();
+      } catch (error) { toast(error.message, 'err'); }
+    },
+  }, '↻');
+
+  const remove = el('button', {
+    class: 'btn small danger', title: 'Delete the file',
+    onclick: async () => {
+      if (!await confirmAction('Delete download?',
+        `“${entry.title}” (${bytes(entry.total_bytes)}) will be removed from this Mac.`, 'Delete')) return;
+      try {
+        await local.post(`/downloads/${entry.id}/delete`);
+        toast('Deleted', 'ok');
+        if (afterChange) afterChange();
+        refreshDownloads();
+      } catch (error) { toast(error.message, 'err'); }
+    },
+  }, '🗑');
+  return [verify, again, remove];
+}
+
+function showFilmSheet(entry) {
+  const close = () => backdrop.remove();
+  const refresh = () => { close(); viewLibrary({ quiet: true }); };
+  const backdrop = el('div', { class: 'modal-backdrop', onclick: (e) => { if (e.target === backdrop) close(); } },
+    el('div', { class: 'modal' },
+      el('h3', {}, entry.title),
+      el('p', { class: 'card-meta', style: 'margin:-6px 0 12px' },
+        [entry.quality, bytes(entry.total_bytes), entry.year].filter(Boolean).join(' · ')),
+      el('div', { class: 'episodes' },
+        el('div', { class: 'episode' },
+          el('span', { class: 'name' }, entry.damaged ? 'This file is damaged and will not play' : 'Saved on this Mac'),
+          entry.damaged
+            ? el('span', { class: 'dur', style: 'color:var(--err)' }, '⚠ damaged')
+            : el('span', { class: 'dur dlstate done' }, '✓ saved'),
+          entry.damaged ? null : el('button', {
+            class: 'btn small primary', title: 'Play from disk',
+            onclick: () => { close(); playLibraryEntry(entry); },
+          }, '▶︎'),
+          savedFileActions(entry, refresh))),
+      el('div', { class: 'actions' },
+        entry.item_id ? el('button', {
+          class: 'btn', onclick: () => { close(); location.hash = '#/item/' + entry.item_id; },
+        }, 'Open on kino.pub ↗') : null,
+        el('button', { class: 'btn ghost', onclick: close }, 'Close'))));
+  $('#overlays').appendChild(backdrop);
+}
+
+async function viewLibrary(options) {
+  const quiet = !!(options && options.quiet);
+  if (libraryRendering) return;
+  libraryRendering = true;
+  if (!quiet) loading();
   try {
-    const data = await local.get('/library');
+    const [data, queue] = await Promise.all([local.get('/library'), local.get('/downloads')]);
+    State.downloads = queue.entries || [];
+    State.freeSpace = queue.free_space || State.freeSpace || 0;
     const entries = data.entries || [];
-    if (!entries.length) {
-      return setView(el('h1', {}, 'Offline library'),
-        empty('✈️', 'Nothing downloaded yet',
-          'Download films ahead of time — they play with no internet on the plane.',
-          el('button', { class: 'btn primary', onclick: () => { location.hash = '#/home'; } }, 'Browse catalog')));
-    }
+    const active = State.downloads.filter((e) => e.status !== 'done');
+    libraryActiveKey = active.map((e) => e.id).join(',');
+    libraryDoneCount = State.downloads.filter((e) => e.status === 'done').length;
+
+    // in progress: the same live rows the Downloads page had
+    downloadRows = new Map();
+    downloadLayout = '';                         // Downloads rebuilds if visited
+    const inProgress = active.length ? el('div', { class: 'inprogress' },
+      el('h2', {}, `⬇️ Downloading (${active.length})`),
+      active.map((entry) => {
+        const row = downloadRow(entry);
+        downloadRows.set(entry.id, row);
+        return row;
+      })) : null;
+
     const groups = new Map();
     for (const entry of entries) {
       const key = entry.show_title || entry.title;
@@ -1618,48 +1767,59 @@ async function viewLibrary() {
     const blocks = [];
     for (const [name, list] of groups) {
       const first = list[0];
-      if (list.length === 1) {
-        blocks.push(card({
-          id: first.item_id, title: first.title, year: first.year,
-          posters: { medium: first.poster_file ? '/poster/' + first.poster_file : '' },
-        }, {
+      const poster = { medium: first.poster_file ? '/poster/' + first.poster_file : '' };
+      if (!first.season) {                       // a film: plays on click, ⋯ manages it
+        blocks.push(card({ id: first.item_id, title: first.title, year: first.year, posters: poster }, {
           badge: first.damaged ? '⚠ damaged' : first.quality,
           meta: bytes(first.total_bytes),
           progress: first.position && first.duration ? Math.min(first.position / first.duration, 1) : 0,
-          onclick: () => (first.season ? showLibraryGroup(name, list) : playLibraryEntry(first)),
-          corner: first.item_id ? {
-            label: '↗',
-            title: first.season ? 'Open the series — all episodes' : 'Open on kino.pub',
-            onclick: () => { location.hash = '#/item/' + first.item_id; },
-          } : null,
+          onclick: () => (first.damaged ? showFilmSheet(first) : playLibraryEntry(first)),
+          corner: { label: '⋯', title: 'Check, download again, delete', onclick: () => showFilmSheet(first) },
         }));
-      } else {
-        blocks.push(card({
-          id: first.item_id, title: name, year: first.year,
-          posters: { medium: first.poster_file ? '/poster/' + first.poster_file : '' },
-        }, {
+      } else {                                   // a series: opens its episode sheet
+        blocks.push(card({ id: first.item_id, title: name, year: first.year, posters: poster }, {
           badge: list.some((e) => e.damaged)
             ? `⚠ ${list.filter((e) => e.damaged).length} damaged`
             : `${list.length} ${list.length === 1 ? 'ep' : 'eps'}`,
           meta: bytes(list.reduce((sum, e) => sum + (e.total_bytes || 0), 0)),
           onclick: () => showLibraryGroup(name, list),
           corner: first.item_id ? {
-            label: '↗',
-            title: 'Open the series — all episodes',
+            label: '↗', title: 'Open the series — all episodes',
             onclick: () => { location.hash = '#/item/' + first.item_id; },
           } : null,
         }));
       }
     }
-    setView(el('h1', {}, 'Offline library'),
-      el('p', { class: 'subtitle' }, `${entries.length} ${entries.length === 1 ? 'file' : 'files'} · ${bytes(totalSize)} · ${data.library_dir}`),
+
+    const summary = `${entries.length} ${entries.length === 1 ? 'file' : 'files'} · ${bytes(totalSize)} · ${data.library_dir}`
+      + (State.freeSpace ? ` · ${bytes(State.freeSpace)} free` : '');
+    let shelf;
+    if (entries.length) {
+      shelf = [el('h2', {}, '✈️ On this Mac'), el('div', { class: 'grid' }, blocks)];
+    } else if (active.length) {
+      shelf = el('p', { class: 'card-meta' }, 'Finished downloads appear here.');
+    } else {
+      shelf = empty('✈️', 'Nothing downloaded yet',
+        'Download films ahead of time — they play with no internet on the plane.',
+        el('button', { class: 'btn primary', onclick: () => { location.hash = '#/home'; } }, 'Browse catalog'));
+    }
+
+    (quiet ? setViewKeepingScroll : setView)(
+      el('h1', {}, 'Offline'),
+      el('p', { class: 'subtitle' }, summary),
       el('div', { class: 'actions', style: 'margin-top:0;margin-bottom:18px' },
         revealButton(null, '📂 Open folder'),
-        verifyButton(entries)),
+        entries.length ? verifyButton(entries) : null,
+        globalSpeedPicker()),
       damagedCount ? el('div', { class: 'banner err' },
-        `⚠️ ${damagedCount} downloaded ${damagedCount === 1 ? 'file is' : 'files are'} damaged and will not play — open the item and press ↻ to download again.`) : null,
-      el('div', { class: 'grid' }, blocks));
-  } catch (error) { setView(errorView(error)); }
+        `⚠️ ${damagedCount} downloaded ${damagedCount === 1 ? 'file is' : 'files are'} damaged and will not play — press ↻ on it to download again.`) : null,
+      inProgress,
+      shelf);
+  } catch (error) {
+    if (!quiet) setView(errorView(error));
+  } finally {
+    libraryRendering = false;
+  }
 }
 
 /** Check every downloaded file parses cleanly; damaged ones get flagged. */
@@ -1701,30 +1861,24 @@ function showLibraryGroup(name, list) {
 
   const close = () => backdrop.remove();
 
-  const redownload = (entry) => el('button', {
-    class: 'btn small', title: 'Download again from scratch',
-    onclick: async () => {
-      await local.post(`/downloads/${entry.id}/restart`);
-      toast('Downloading again', 'ok');
-      close();
-    },
-  }, '↻');
+  const afterChange = () => { close(); viewLibrary({ quiet: true }); };
 
-  const savedRow = (entry) => el('div', { class: 'episode' },
-    el('span', { class: 'num' }, entry.season ? `${entry.season}×${String(entry.episode).padStart(2, '0')}` : '▶︎'),
-    el('span', { class: 'name' }, entry.episode_title || entry.title),
+  // status, play (unless damaged), then check / download again / delete
+  const savedControls = (entry) => [
     entry.available === false
       ? el('span', { class: 'dur', style: 'color:var(--err)' }, 'file deleted')
       : entry.damaged
         ? el('span', { class: 'dur', style: 'color:var(--err)' }, '⚠ damaged')
         : el('span', { class: 'dur dlstate done' }, '✓ saved'),
-    entry.damaged
-      ? redownload(entry)
+    entry.damaged || entry.available === false ? null
       : el('button', { class: 'btn small primary', title: 'Play from disk', onclick: () => { close(); playLibraryEntry(entry); } }, '▶︎'),
-    el('button', {
-      class: 'btn small danger', title: 'Delete the file',
-      onclick: async () => { await local.post(`/downloads/${entry.id}/delete`); close(); viewLibrary(); },
-    }, '🗑'));
+    ...savedFileActions(entry, afterChange),
+  ];
+
+  const savedRow = (entry) => el('div', { class: 'episode' },
+    el('span', { class: 'num' }, entry.season ? `${entry.season}×${String(entry.episode).padStart(2, '0')}` : '▶︎'),
+    el('span', { class: 'name' }, entry.episode_title || entry.title),
+    savedControls(entry));
 
   // what we know without the network: the downloaded episodes
   const renderSavedOnly = () => {
@@ -1763,15 +1917,8 @@ function showLibraryGroup(name, list) {
         media.duration ? el('span', { class: 'dur' }, duration(media.duration)) : null,
         isWatched(media) ? el('span', { class: 'dur', style: 'color:var(--ok)' }, '✓') : null);
 
-      if (saved && saved.damaged) {
-        row.appendChild(el('span', { class: 'dur', style: 'color:var(--err)' }, '⚠ damaged'));
-        row.appendChild(redownload(saved));
-      } else if (saved) {
-        row.appendChild(el('span', { class: 'dur dlstate done' }, '✓ saved'));
-        row.appendChild(el('button', {
-          class: 'btn small primary', title: 'Play from disk',
-          onclick: () => { close(); playLibraryEntry(saved); },
-        }, '▶︎'));
+      if (saved) {
+        savedControls(saved).forEach((node) => node && row.appendChild(node));
       } else if (queued && queued.status !== 'done') {
         row.appendChild(el('span', { class: 'dur dlstate ' + queued.status }, downloadBadgeText(queued)));
       } else {

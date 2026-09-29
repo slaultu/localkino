@@ -205,6 +205,14 @@ def downloads_limit(entry_id, body):
     return {"entry": entry}
 
 
+def downloads_verify(entry_id, _body):
+    """Parse one downloaded file end to end; reports whether it is damaged."""
+    result = downloader.verify_one(entry_id)
+    if result is None:
+        raise HttpError(404, "Entry not found")
+    return result
+
+
 def downloads_action(entry_id, action):
     handlers = {
         "pause": downloader.pause,

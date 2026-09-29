@@ -741,6 +741,22 @@ def is_damaged(path):
     return errors is not None and errors > INTEGRITY_ERROR_LIMIT
 
 
+def verify_one(entry_id):
+    """Integrity-check a single downloaded file and record the verdict."""
+    entry = store.get(entry_id)
+    if not entry:
+        return None
+    path = human_path(entry)
+    if not os.path.exists(path):
+        return {"damaged": None, "missing": True}
+    errors = check_integrity(path)
+    if errors is None:
+        return {"damaged": None, "errors": None}
+    damaged = errors > INTEGRITY_ERROR_LIMIT
+    store.update(entry_id, {"damaged": damaged, "verified_at": time.time()})
+    return {"damaged": damaged, "errors": errors}
+
+
 _verify_state = {"running": False, "checked": 0, "total": 0, "damaged": 0}
 
 
@@ -875,10 +891,26 @@ def pause(entry_id):
     return False
 
 
+def _refresh_source(entry_id):
+    """Swap in a freshly issued stream link. Best effort: offline keeps the old one.
+
+    The API's stream links expire 24h after they are issued, so fetching a
+    file again later with the link stored at queue time would fail at once.
+    """
+    entry = store.get(entry_id)
+    if not entry:
+        return
+    fresh = _lookup_stream(entry)
+    if fresh:
+        store.update(entry_id, {"source_url": fresh, "stream_type": "hls"}, flush=False)
+
+
 def resume(entry_id):
     entry = store.get(entry_id)
     if not entry or entry.get("status") not in ("paused", "error"):
         return False
+    if entry.get("status") == "error":
+        _refresh_source(entry_id)
     store.update(entry_id, {"status": "queued", "error": None, "paused_by_user": False})
     _wake.set()
     return True
@@ -919,6 +951,7 @@ def restart(entry_id):
         "downloaded_bytes": 0, "total_bytes": 0, "speed": 0,
         "attempt": 0, "paused_by_user": False, "damaged": False,
     })
+    _refresh_source(entry_id)
     _wake.set()
     return True
 

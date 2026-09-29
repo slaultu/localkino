@@ -165,6 +165,10 @@ class Handler(BaseHTTPRequestHandler):
         if path.startswith("/kp/"):
             return self._json(routes.kp_proxy(path[len("/kp/"):], params, method, body))
 
+        match = re.match(r"^/downloads/([0-9a-f]+)/verify$", path)
+        if match and method == "POST":
+            return self._json(routes.downloads_verify(match.group(1), body))
+
         match = re.match(r"^/downloads/([0-9a-f]+)/limit$", path)
         if match and method == "POST":
             return self._json(routes.downloads_limit(match.group(1), body))
