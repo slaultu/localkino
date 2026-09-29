@@ -134,7 +134,6 @@ const NAV = [
   { hash: '#/bookmarks', icon: '⭐️', label: 'Bookmarks' },
   { hash: '#/watching', icon: '👁', label: 'Watching' },
   { sep: true },
-  { hash: '#/downloads', icon: '⬇️', label: 'Downloads' },
   { hash: '#/library', icon: '✈️', label: 'Offline', badge: () => State.activeDownloads },
   { hash: '#/settings', icon: '⚙️', label: 'Settings' },
   { action: 'quit', icon: '⏻', label: 'Shut down' },
@@ -1290,7 +1289,7 @@ function openPlayer(options) {
     if (options.entryId) {
       const code = (video.error || {}).code;
       if (code === 3) {                        // MEDIA_ERR_DECODE
-        return toast('This file is damaged and cannot be played. Re-download it: Downloads → ↻', 'err');
+        return toast('This file is damaged and cannot be played. Re-download it: Offline → ↻', 'err');
       }
       if (code === 4) {                        // MEDIA_ERR_SRC_NOT_SUPPORTED
         return toast('The browser cannot play this format. QuickTime or VLC may.', 'err');
@@ -1478,7 +1477,6 @@ async function refreshDownloads() {
     State.freeSpace = data.free_space || 0;
     State.activeDownloads = State.downloads.filter((e) => ['queued', 'downloading', 'paused', 'error'].includes(e.status)).length;
     renderNav();
-    if ((location.hash || '').startsWith('#/downloads')) renderDownloads();
     if ((location.hash || '').startsWith('#/library')) refreshLibraryInPlace();
     if (repaintItemDownloads && (location.hash || '').startsWith('#/item/')) {
       repaintItemDownloads();
@@ -1617,66 +1615,6 @@ function downloadRow(entry) {
 }
 
 let downloadRows = new Map();
-let downloadLayout = '';
-
-function downloadsLayoutKey(active, done) {
-  return active.map((e) => e.id).join(',') + '|' + done.map((e) => e.id).join(',');
-}
-
-function renderDownloads(options) {
-  const active = State.downloads.filter((e) => e.status !== 'done');
-  const done = State.downloads.filter((e) => e.status === 'done').slice(0, 40);
-  const layout = downloadsLayoutKey(active, done);
-
-  /* Nothing appeared or finished, so keep the page exactly as it is and let
-     each row refresh its own numbers - otherwise a poll every two seconds
-     would throw you back to the top of the list mid-scroll. */
-  if (!options || !options.rebuild) {
-    if (layout === downloadLayout && downloadRows.size) {
-      for (const entry of State.downloads) {
-        const row = downloadRows.get(entry.id);
-        if (row) row.update(entry);
-      }
-      const note = $('#free-space-note');
-      if (note) note.textContent = freeSpaceNote();
-      return;
-    }
-  }
-
-  downloadRows = new Map();
-  const build = (entry) => {
-    const row = downloadRow(entry);
-    downloadRows.set(entry.id, row);
-    return row;
-  };
-
-  // arriving on the page starts at the top; a list that changed under you
-  // (something finished) is rebuilt where you were reading
-  const arrivedFresh = !!(options && options.rebuild);
-  const hadRows = !!downloadLayout;
-  downloadLayout = layout;
-  const render = (!arrivedFresh && hadRows) ? setViewKeepingScroll : setView;
-  render(
-    el('h1', {}, 'Downloads'),
-    el('p', { class: 'subtitle', id: 'free-space-note' }, freeSpaceNote()),
-    el('div', { class: 'actions', style: 'margin-top:0' }, revealButton(null, '📂 Open folder')),
-    active.length ? el('div', {}, active.map(build)) : empty('✅', 'No active downloads',
-      'Open a film and press Download.'),
-    done.length ? el('div', {}, el('h2', {}, 'Completed'), done.map(build)) : null);
-}
-
-function freeSpaceNote() {
-  return `Folder: ${State.settings.library_dir || ''}`
-    + (State.freeSpace ? ` · ${bytes(State.freeSpace)} free` : '');
-}
-
-function viewDownloads() {
-  downloadLayout = '';                 // arriving fresh: full render, top of page
-  downloadRows = new Map();
-  renderDownloads({ rebuild: true });
-  refreshDownloads();
-}
-
 /* ----------------------------------------------------------------- library */
 function playLibraryEntry(entry) {
   const subtitles = (entry.subtitles || []).map((sub) => ({
@@ -1891,9 +1829,8 @@ async function viewLibrary(options) {
     libraryActiveKey = active.map((e) => e.id).join(',');
     libraryDoneCount = State.downloads.filter((e) => e.status === 'done').length;
 
-    // in progress: the same live rows the Downloads page had
+    // in progress: live rows with their controls
     downloadRows = new Map();
-    downloadLayout = '';                         // Downloads rebuilds if visited
     bulkButtons = null;
     const inProgress = active.length ? el('div', { class: 'inprogress' },
       el('h2', {}, `⬇️ Downloading (${active.length})`, bulkControls()),
@@ -2055,30 +1992,32 @@ function showLibraryGroup(name, list) {
     el('span', { class: 'name' }, entry.episode_title || entry.title),
     savedControls(entry));
 
-  // what we know without the network: the downloaded episodes
+  // only for a series never seen online: the downloaded episodes alone
   const renderSavedOnly = () => {
     body.textContent = '';
     note.textContent = `${list.length} downloaded`;
     list.forEach((entry) => body.appendChild(savedRow(entry)));
   };
-  renderSavedOnly();
+  if (!itemId) return renderSavedOnly();
 
-  if (!itemId) return;
+  const isWatched = (media) => Number(media.watched) === 1
+    || Number((media.watching || {}).status) === 1;
+  let shown = null;                               // what the rows currently reflect
 
-  // the whole series - live, or the kept copy when offline - so the gaps show
-  itemWithCache(itemId).then((data) => {
+  // every season and episode, downloaded or not
+  const renderFull = (data, stale) => {
     const item = data.item || {};
     const medias = mediaList(item);
-    if (!medias.length) return;
-    const preferred = State.settings.preferred_quality;
-    const isWatched = (media) => Number(media.watched) === 1
-      || Number((media.watching || {}).status) === 1;
-
-    body.textContent = '';
+    if (!medias.length) return false;
+    // redraw only when something visible changed (new episode, watched mark)
+    const signature = JSON.stringify(medias.map((m) => [m.media_id, m.title, isWatched(m), m.duration]));
     const savedCount = medias.filter((m) => savedByMedia.has(String(m.media_id))).length;
     note.textContent = `${savedCount} of ${medias.length} episodes downloaded`
-      + (data._cached_at ? ' · offline, from the saved list' : '');
+      + (stale ? ' · saved list (no internet)' : '');
+    if (signature === shown) return true;
+    shown = signature;
 
+    body.textContent = '';
     let season = null;
     for (const media of medias) {
       if (media.season !== season) {
@@ -2101,15 +2040,40 @@ function showLibraryGroup(name, list) {
         row.appendChild(el('span', { class: 'dur', style: 'opacity:.6' }, 'not downloaded'));
         row.appendChild(el('button', {
           class: 'btn small', title: 'Download',
-          onclick: () => qualityModal(media.title, media.files, (file) => {
-            queueDownload(item, media, file);
-            close();
-          }),
+          onclick: () => {
+            if (!(media.files || []).length || !navigator.onLine) {
+              return toast('Downloading needs internet', 'err');
+            }
+            return qualityModal(media.title, media.files, (file) => {
+              queueDownload(item, media, file);
+              close();
+            });
+          },
         }, '⬇︎'));
       }
       body.appendChild(row);
     }
-  }).catch(() => { /* offline or API trouble: the downloaded list stays */ });
+    return true;
+  };
+
+  /* The kept copy is a local file, so the full list is there at once whether
+     online or not. The live list follows in the background; the server keeps
+     it as the new copy, and the rows change only if something did. */
+  let live = false;
+  const copy = local.get('/cache/items/' + itemId).catch(() => null);
+  const fresh = navigator.onLine ? kp('items/' + itemId).catch(() => null) : Promise.resolve(null);
+  copy.then((data) => {
+    if (live || !backdrop.isConnected) return;
+    if (!data || !renderFull(data, !navigator.onLine)) renderSavedOnly();
+  });
+  fresh.then((data) => {
+    if (!data || data._cached_at || !backdrop.isConnected) {
+      copy.then((kept) => { if (kept && !live && backdrop.isConnected) renderFull(kept, true); });
+      return;
+    }
+    live = true;
+    renderFull(data, false);
+  });
 }
 
 /* ---------------------------------------------------------------- settings */
@@ -2255,7 +2219,7 @@ async function route() {
     case 'collection': return viewCollection(parts[1]);
     case 'bookmarks': return viewBookmarks(parts[1]);
     case 'watching': return viewWatching();
-    case 'downloads': return viewDownloads();
+    case 'downloads': location.replace('#/library'); return undefined;   // merged into Offline
     case 'library': return viewLibrary();
     case 'settings': return viewSettings();
     case 'auth': return viewAuth();
@@ -2278,7 +2242,7 @@ async function bootState() {
 
 /** Decide which screen to open on launch. Returns the hash it chose. */
 async function chooseStartRoute() {
-  const openable = ['#/settings', '#/auth', '#/library', '#/downloads'];
+  const openable = ['#/settings', '#/auth', '#/library'];
   const current = location.hash || '';
   const atStart = !current || current === '#/' || current === '#/home';
   if (!navigator.onLine && atStart) {
