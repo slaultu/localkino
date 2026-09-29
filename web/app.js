@@ -1515,6 +1515,25 @@ function speedPicker(entry) {
     el('option', { value, selected: value === current }, label)));
 }
 
+/* Only a direct (http) download can pick up where it stopped; an HLS one
+   always starts from zero. So "try again" and "start over" are different
+   buttons only for a direct download with something already on disk. */
+function canContinue(entry) {
+  return entry.stream_type === 'http' && (entry.downloaded_bytes || 0) > 0;
+}
+
+function retryHint(entry) {
+  const how = canContinue(entry) ? 'continues from where it stopped' : 'starts from the beginning';
+  return `Try again — ${how}` + (entry.error ? `\nLast error: ${entry.error}` : '');
+}
+
+/* ↻ is worth showing to kick a download that is running or paused, or for a
+   failed direct download where it differs from try again. */
+function offersStartOver(entry) {
+  if (entry.status === 'downloading' || entry.status === 'paused') return true;
+  return entry.status === 'error' && canContinue(entry);
+}
+
 function downloadRow(entry) {
   const img = el('img', { src: entry.poster_file ? '/poster/' + entry.poster_file : PLACEHOLDER, alt: '' });
   img.addEventListener('error', () => { img.src = PLACEHOLDER; });
@@ -1579,15 +1598,15 @@ function downloadRow(entry) {
       shownStatus = entry.status;
       actions.textContent = '';
       [
-        entry.status === 'downloading' || entry.status === 'queued' ? action('pause', '❚❚') : null,
-        entry.status === 'paused' ? action('resume', '▶︎') : null,
-        entry.status === 'error' ? action('retry', '⟳') : null,
-        entry.status !== 'done' ? action('restart', '↻', '', 'Start this download over from zero') : null,
+        entry.status === 'downloading' || entry.status === 'queued' ? action('pause', '❚❚', '', 'Pause') : null,
+        entry.status === 'paused' ? action('resume', '▶︎', '', 'Resume') : null,
+        entry.status === 'error' ? action('retry', '⟳', '', retryHint(entry)) : null,
+        offersStartOver(entry) ? action('restart', '↻', '', 'Start over — throw away what is downloaded and begin from zero') : null,
         entry.status !== 'done' ? speedPicker(entry) : null,
         entry.status === 'done'
-          ? el('button', { class: 'btn small primary', onclick: () => playLibraryEntry(entry) }, '▶︎')
+          ? el('button', { class: 'btn small primary', title: 'Play from disk', onclick: () => playLibraryEntry(entry) }, '▶︎')
           : null,
-        action('delete', '🗑', 'danger'),
+        action('delete', '🗑', 'danger', entry.status === 'done' ? 'Delete the file' : 'Cancel and delete'),
       ].forEach((node) => node && actions.appendChild(node));
     }
   }
@@ -1977,9 +1996,9 @@ function showLibraryGroup(name, list) {
       el('span', { class: 'dur dlstate ' + status, title: entry.error || '' }, downloadBadgeText(entry)),
       status === 'downloading' || status === 'queued' ? act('pause', '❚❚', 'Pause') : null,
       status === 'paused' ? act('resume', '▶︎', 'Resume') : null,
-      status === 'error' ? act('retry', '⟳', 'Try again' + (entry.error ? ' — ' + entry.error : '')) : null,
-      status !== 'queued' ? act('restart', '↻', 'Start over from zero') : null,
-      act('delete', '🗑', 'Delete', 'danger'),
+      status === 'error' ? act('retry', '⟳', retryHint(entry)) : null,
+      offersStartOver(entry) ? act('restart', '↻', 'Start over — throw away what is downloaded and begin from zero') : null,
+      act('delete', '🗑', 'Cancel and delete', 'danger'),
     ];
   };
 
