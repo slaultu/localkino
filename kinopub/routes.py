@@ -236,6 +236,14 @@ def downloads_limit(entry_id, body):
     return {"entry": entry}
 
 
+def downloads_pause_all(_params, _body):
+    return {"paused": downloader.pause_all()}
+
+
+def downloads_resume_all(_params, _body):
+    return {"resumed": downloader.resume_all()}
+
+
 def downloads_verify(entry_id, _body):
     """Parse one downloaded file end to end; reports whether it is damaged."""
     result = downloader.verify_one(entry_id)

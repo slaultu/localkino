@@ -350,7 +350,8 @@ class TestDownloadEndToEnd(ServerTestCase):
     """Queue a real download and check what lands on disk."""
 
     def setUp(self):
-        self.payload = os.urandom(300 * 1024)
+        with open(os.path.join(ROOT, "tools", "sample.mp4"), "rb") as fh:
+            self.payload = fh.read()   # a real 10s video: the completeness gate checks its length
         payload = self.payload
 
         class Origin(BaseHTTPRequestHandler):
@@ -607,3 +608,169 @@ class TestItemCache(unittest.TestCase):
                        lambda: routes.kp_proxy("items/fresh", {"type": "movie"}, "GET", {}))
         with self.assertRaises(api.Offline):
             self._with_api(self._offline, lambda: routes.kp_proxy("items/fresh", {"type": "movie"}, "GET", {}))
+
+
+# --------------------------------------------------------------------------- #
+class TestResumableHls(unittest.TestCase):
+    """HLS downloads keep finished segments across a stop and never refetch them."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.ffmpeg = downloader.which_ffmpeg()
+        if not cls.ffmpeg:
+            raise unittest.SkipTest("ffmpeg not available")
+        cls.site = tempfile.mkdtemp(prefix="kp-hlssite-")
+        sample = os.path.join(ROOT, "tools", "sample.mp4")
+        run = lambda *a: subprocess.run([cls.ffmpeg, "-y", "-loglevel", "error", *a], check=True,  # noqa: E731
+                                        cwd=cls.site, timeout=120)
+        # video and audio in separate playlists, 2s segments - the service's layout
+        run("-i", sample, "-an", "-c:v", "libx264", "-g", "24", "-keyint_min", "24", "-sc_threshold", "0",
+            "-f", "hls", "-hls_time", "2", "-hls_playlist_type", "vod", "-hls_segment_filename", "v%d.ts", "video.m3u8")
+        run("-i", sample, "-vn", "-c:a", "aac", "-f", "hls", "-hls_time", "2", "-hls_playlist_type", "vod",
+            "-hls_segment_filename", "a%d.ts", "audio.m3u8")
+        with open(os.path.join(cls.site, "master.m3u8"), "w") as fh:
+            fh.write('#EXTM3U\n#EXT-X-VERSION:3\n'
+                     '#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="aud",NAME="rus",DEFAULT=YES,URI="audio.m3u8"\n'
+                     '#EXT-X-STREAM-INF:BANDWIDTH=800000,RESOLUTION=640x360,AUDIO="aud"\nvideo.m3u8\n')
+        cls.segments = sorted(n for n in os.listdir(cls.site) if n.endswith(".ts"))
+
+        site, hits, fail_once = cls.site, {}, set()
+        cls.hits, cls.fail_once = hits, fail_once
+
+        class Site(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, *a):
+                pass
+
+            def do_GET(self):
+                name = self.path.lstrip("/").split("?")[0]
+                hits[name] = hits.get(name, 0) + 1
+                if name in fail_once:
+                    fail_once.discard(name)
+                    self.send_response(503)
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+                path = os.path.join(site, name)
+                if not os.path.isfile(path):
+                    self.send_response(404)
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+                with open(path, "rb") as fh:
+                    body = fh.read()
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        cls.port, cls.stop_site = serve(Site)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.stop_site()
+        shutil.rmtree(cls.site, ignore_errors=True)
+
+    def setUp(self):
+        self.library = tempfile.mkdtemp(prefix="kp-hlslib-")
+        self.previous = config.get("library_dir")
+        config.save_settings({"library_dir": self.library})
+        self.hits.clear()
+        self.entry = store.add({
+            "title": "Show S01E01", "quality": "360p", "duration": 10, "stream_type": "hls",
+            "source_url": "http://127.0.0.1:%d/master.m3u8" % self.port,
+            "rel_path": "Show/Show - S01E01 [360p].mp4", "media_id": "hls-%s" % time.time(),
+        })
+
+    def tearDown(self):
+        config.save_settings({"library_dir": self.previous})
+        store.remove(self.entry["id"])
+        shutil.rmtree(self.library, ignore_errors=True)
+
+    def _segment_hits(self):
+        return sum(n for name, n in self.hits.items() if name.endswith(".ts"))
+
+    def _check_result(self):
+        path = downloader.human_path(store.get(self.entry["id"]))
+        media = downloader.probe_media(path)
+        self.assertTrue(media["video"] and media["audio"], media)
+        self.assertAlmostEqual(media["seconds"], 10, delta=1.0)
+        self.assertIsNone(downloader.completeness_problem(path, 10))
+        self.assertFalse(os.path.exists(downloader.work_dir(self.entry)), "segments left behind")
+        recorded = store.get(self.entry["id"]).get("stream_seconds")
+        self.assertAlmostEqual(recorded, 10, delta=0.5, msg="the stream length is the reference")
+
+    def test_full_download_joins_video_and_audio(self):
+        self.assertTrue(downloader._hls_segment_download(store.get(self.entry["id"]), threading.Event()))
+        self.assertEqual(self._segment_hits(), len(self.segments))     # each fetched once
+        self._check_result()
+
+    def test_a_stop_keeps_segments_and_resume_fetches_only_the_rest(self):
+        stop = threading.Event()
+        real = downloader._fetch_segment
+        finished = []
+
+        def fetch_then_stop(*args, **kwargs):
+            ok = real(*args, **kwargs)
+            if ok:
+                finished.append(1)
+                if len(finished) == 3:
+                    stop.set()                  # like pressing pause, or the power going
+            return ok
+        downloader._fetch_segment = fetch_then_stop
+        try:
+            self.assertFalse(downloader._hls_segment_download(store.get(self.entry["id"]), stop))
+        finally:
+            downloader._fetch_segment = real
+        kept = [n for d in ("v", "a") for n in os.listdir(os.path.join(downloader.work_dir(self.entry), d))]
+        self.assertEqual(len(kept), 3, "finished segments must survive the stop")
+        self.assertFalse([n for n in kept if n.endswith(".tmp")], "no half segments")
+
+        self.hits.clear()
+        self.assertTrue(downloader._hls_segment_download(store.get(self.entry["id"]), threading.Event()))
+        self.assertEqual(self._segment_hits(), len(self.segments) - 3, "resume refetched finished segments")
+        self._check_result()
+
+    def test_a_failing_segment_is_retried(self):
+        self.fail_once.add("v1.ts")
+        self.assertTrue(downloader._hls_segment_download(store.get(self.entry["id"]), threading.Event()))
+        self.assertEqual(self.hits["v1.ts"], 2)
+        self._check_result()
+
+
+class TestCompleteness(unittest.TestCase):
+    """A file that stopped early parses fine - its length gives it away."""
+
+    def setUp(self):
+        if not downloader.which_ffmpeg():
+            self.skipTest("ffmpeg not available")
+        self.sample = os.path.join(ROOT, "tools", "sample.mp4")
+        self.tmp = tempfile.mkdtemp(prefix="kp-complete-")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_whole_file_passes(self):
+        self.assertIsNone(downloader.completeness_problem(self.sample, 10))
+
+    def test_short_file_is_caught_even_though_it_parses(self):
+        short = os.path.join(self.tmp, "short.mp4")
+        subprocess.run([downloader.which_ffmpeg(), "-y", "-loglevel", "error", "-i", self.sample,
+                        "-t", "4", "-c", "copy", short], check=True, timeout=60)
+        self.assertFalse(downloader.is_damaged(short), "a cut file still parses cleanly")
+        problem = downloader.completeness_problem(short, 60)
+        self.assertIsNotNone(problem)
+        self.assertIn("of 1:00", problem)
+
+    def test_api_length_is_only_a_loose_reference(self):
+        # the API reports episodes up to minutes longer than the stream; against
+        # it a whole file must not be called incomplete
+        self.assertIsNone(downloader.completeness_problem(self.sample, 10.6, strict=False))
+        self.assertIsNotNone(downloader.completeness_problem(self.sample, 200, strict=False))
+
+    def test_file_without_sound_is_caught(self):
+        mute = os.path.join(self.tmp, "mute.mp4")
+        subprocess.run([downloader.which_ffmpeg(), "-y", "-loglevel", "error", "-i", self.sample,
+                        "-an", "-c", "copy", mute], check=True, timeout=60)
+        self.assertEqual(downloader.completeness_problem(mute, 10), "the file has no sound")

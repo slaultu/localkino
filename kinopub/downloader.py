@@ -13,14 +13,14 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-from . import config, store
+from . import config, hls_mirror, store
 
 CHUNK = 1024 * 256
 PROGRESS_INTERVAL = 0.7
 UA = "KinoPubOffline/1.0"
 # a flaky hotel/airport wifi should not lose a download (tests shorten this)
-MAX_ATTEMPTS = int(os.environ.get("KP_MAX_ATTEMPTS") or 6)
-BACKOFF_CAP = 30
+MAX_ATTEMPTS = int(os.environ.get("KP_MAX_ATTEMPTS") or 8)   # ~3 min of backoff in total
+BACKOFF_CAP = 60
 DISK_MARGIN = 500 * 1024 * 1024   # keep the boot volume breathing room
 
 class TransferTruncated(Exception):
@@ -484,6 +484,244 @@ def _hls_download(entry, stop):
 # --------------------------------------------------------------------------- #
 # worker
 # --------------------------------------------------------------------------- #
+SEGMENT_TIMEOUT = 30          # per socket operation; a slow host is fine, a silent one is not
+SEGMENT_TRIES = 4             # per segment, before drawing other hosts
+MAX_REDRAWS = 4               # host re-draws after failures, per run
+SLOW_SEGMENT_SECONDS = 60     # two segments this slow in a row: try other hosts
+
+
+def work_dir(entry):
+    """Hidden folder next to the film where its segments are mirrored."""
+    folder, name = os.path.split(human_path(entry))
+    return os.path.join(folder, "." + os.path.splitext(name)[0] + ".hls")
+
+
+def _fetch_text(url, timeout=20):
+    request = urllib.request.Request(url, headers={"User-Agent": UA})
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return response.read().decode("utf-8", "replace")
+
+
+def _resolve_plan(entry, fresh_link=False):
+    """Segment lists for this entry's quality, from a freshly fetched master.
+
+    Every fetch of the master draws new CDN hosts, which is how a dead one is
+    escaped. An expired link (the API issues them for 24h) is renewed once.
+    """
+    if fresh_link:
+        _refresh_source(entry["id"])
+        entry = store.get(entry["id"]) or entry
+    master_url = entry["source_url"]
+    try:
+        text = _fetch_text(master_url)
+    except urllib.error.HTTPError as exc:
+        if exc.code in (401, 403, 404, 410) and not fresh_link:
+            return _resolve_plan(entry, fresh_link=True)
+        raise
+    master = hls_mirror.parse_master(text, master_url)
+    if not master["variants"]:                  # already a media playlist
+        return {"video": hls_mirror.parse_media(text, master_url), "audio": None, "bandwidth": 0}
+    variant = hls_mirror.pick_variant(master["variants"], entry.get("quality"))
+    video = hls_mirror.parse_media(_fetch_text(variant["uri"]), variant["uri"])
+    rendition = hls_mirror.pick_audio(master["audio"], variant["audio"])
+    audio = hls_mirror.parse_media(_fetch_text(rendition["uri"]), rendition["uri"]) if rendition else None
+    return {"video": video, "audio": audio, "bandwidth": variant["bandwidth"]}
+
+
+def _redraw_plan(entry, old):
+    """Same segments, other hosts. Refuses if the stream itself changed."""
+    new = _resolve_plan(entry)
+    for kind in ("video", "audio"):
+        before = len(old[kind]["segments"]) if old.get(kind) else 0
+        after = len(new[kind]["segments"]) if new.get(kind) else 0
+        if before != after:
+            raise RuntimeError("the stream changed while downloading - start it over")
+    return new
+
+
+def _fetch_segment(url, dest, limiters, stop, count):
+    """Download one segment to dest via a temp name. False means stop was asked."""
+    tmp = dest + ".tmp"
+    try:
+        request = urllib.request.Request(url, headers={"User-Agent": UA})
+        with urllib.request.urlopen(request, timeout=SEGMENT_TIMEOUT) as response, open(tmp, "wb") as fh:
+            expected = int(response.headers.get("Content-Length") or 0)
+            got = 0
+            while True:
+                if stop.is_set():
+                    return False
+                chunk = response.read(CHUNK)
+                if not chunk:
+                    break
+                for limiter in limiters:
+                    limiter.take(len(chunk), stop)
+                fh.write(chunk)
+                got += len(chunk)
+                count(len(chunk))
+        if not got or (expected and got < expected):
+            raise TransferTruncated("segment ended early (%d of %d bytes)" % (got, expected))
+        os.replace(tmp, dest)                   # only a whole segment gets the real name
+        return True
+    finally:
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+
+
+def _hls_segment_download(entry, stop):
+    """Resumable HLS download. Raises hls_mirror.Unsupported for odd streams."""
+    ffmpeg = which_ffmpeg()
+    if not ffmpeg:
+        raise RuntimeError("ffmpeg not found - install it (brew install ffmpeg) or switch stream type to http")
+    path = human_path(entry)
+    folder = os.path.dirname(path)
+    work = work_dir(entry)
+    dirs = {"video": os.path.join(work, "v"), "audio": os.path.join(work, "a")}
+    for directory in dirs.values():
+        os.makedirs(directory, exist_ok=True)
+        for name in os.listdir(directory):      # half-written leftovers from a crash
+            if name.endswith(".tmp"):
+                try:
+                    os.remove(os.path.join(directory, name))
+                except OSError:
+                    pass
+
+    plan = _resolve_plan(entry)
+    store.update(entry["id"], {"stream_seconds": sum(seg["duration"] for seg in plan["video"]["segments"])},
+                 flush=False)
+    jobs = []
+    for index in range(max(len(plan["video"]["segments"]),
+                           len(plan["audio"]["segments"]) if plan["audio"] else 0)):
+        for kind in ("video", "audio"):
+            if plan.get(kind) and index < len(plan[kind]["segments"]):
+                jobs.append((kind, index))
+    target = lambda kind, index: os.path.join(dirs[kind], "%05d.ts" % index)  # noqa: E731
+
+    done_count = sum(1 for kind, index in jobs if os.path.exists(target(kind, index)))
+    done_bytes = sum(os.path.getsize(target(k, i)) for k, i in jobs if os.path.exists(target(k, i)))
+    seconds = sum(seg["duration"] for seg in plan["video"]["segments"])
+    estimate = int(plan.get("bandwidth", 0) / 8.0 * seconds) or done_bytes
+    if done_count >= 3:
+        estimate = int(done_bytes / float(done_count) * len(jobs))
+    # room for the rest of the segments, then the joined file beside them
+    _check_space(max(estimate - done_bytes, 0) + estimate, folder)
+
+    limiters = (entry_limiter(entry), global_limiter())
+    window = [(time.time(), 0)]
+    live = {"bytes": 0, "last": 0.0}
+
+    def count(n):
+        live["bytes"] += n
+        now = time.time()
+        if now - live["last"] < PROGRESS_INTERVAL:
+            return
+        live["last"] = now
+        window.append((now, live["bytes"]))
+        while len(window) > 2 and now - window[0][0] > 10:
+            window.pop(0)
+        span = now - window[0][0]
+        speed = (live["bytes"] - window[0][1]) / span if span > 0 else 0
+        total = int(done_bytes / float(done_count) * len(jobs)) if done_count >= 3 else estimate
+        have = done_bytes + live["current"]
+        store.update(entry["id"], {
+            "progress": round(min(done_count / float(len(jobs)), 0.999), 4),
+            "downloaded_bytes": have, "total_bytes": max(total, have), "speed": int(speed),
+            "eta": int((total - have) / speed) if speed > 0 and total > have else 0,
+        }, flush=False)
+
+    store.update(entry["id"], {"error": None, "attempt": 0}, flush=False)
+    redraws, slow_redraws, slow_streak = 0, 0, 0
+    for kind, index in jobs:
+        dest = target(kind, index)
+        if os.path.exists(dest):
+            continue
+        tries = 0
+        while True:
+            live["current"] = 0
+            started = time.time()
+
+            def counted(n):
+                live["current"] += n
+                count(n)
+            try:
+                if not _fetch_segment(plan[kind]["segments"][index]["uri"], dest, limiters, stop, counted):
+                    return False                # paused or cancelled: finished segments stay
+            except Exception as exc:            # noqa: BLE001 - classified below
+                if stop.is_set():
+                    return False
+                if not (_is_retryable(exc) or isinstance(exc, urllib.error.HTTPError)):
+                    raise
+                tries += 1
+                if tries < SEGMENT_TRIES:
+                    if not _sleep_interruptible(min(2 ** tries, 16), stop):
+                        return False
+                    continue
+                if redraws >= MAX_REDRAWS:
+                    raise
+                redraws, tries = redraws + 1, 0
+                store.update(entry["id"], {"error": "A server stopped answering - switching to another…"}, flush=False)
+                plan = _redraw_plan(entry, plan)
+                continue
+            if time.time() - started > SLOW_SEGMENT_SECONDS:
+                slow_streak += 1
+            else:
+                slow_streak = 0
+            if slow_streak >= 2 and slow_redraws < 5:
+                slow_redraws, slow_streak = slow_redraws + 1, 0
+                try:
+                    plan = _redraw_plan(entry, plan)
+                except Exception:               # noqa: BLE001 - keep the slow one
+                    pass
+            done_count += 1
+            done_bytes += os.path.getsize(dest)
+            live["current"] = 0
+            store.update(entry["id"], {"error": None}, flush=False)
+            break
+
+    # every segment is on disk: join them locally
+    playlists = []
+    for kind in ("video", "audio"):
+        if not plan.get(kind):
+            continue
+        playlist = os.path.join(work, kind + ".m3u8")
+        names = [os.path.join(dirs[kind], "%05d.ts" % i) for i in range(len(plan[kind]["segments"]))]
+        with open(playlist, "w", encoding="utf-8") as handle:
+            handle.write(hls_mirror.local_playlist(plan[kind]["segments"], names, plan[kind]["target"]))
+        playlists.append(playlist)
+    _check_space(done_bytes, folder)
+    part = os.path.splitext(path)[0] + ".part.mp4"
+    cmd = [ffmpeg, "-y", "-loglevel", "error"]
+    for playlist in playlists:
+        cmd += ["-protocol_whitelist", "file", "-i", playlist]
+    cmd += (["-map", "0:v:0", "-map", "1:a:0"] if len(playlists) == 2 else ["-map", "0"])
+    cmd += ["-c", "copy", "-bsf:a", "aac_adtstoasc", "-movflags", "+faststart", part]
+    store.update(entry["id"], {"error": "Joining the pieces…", "speed": 0, "progress": 0.999}, flush=False)
+    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+    _register(proc)
+    try:
+        while proc.poll() is None:
+            if stop.is_set():
+                proc.terminate()
+                proc.wait(timeout=10)
+                return False                    # segments are all still there
+            time.sleep(0.5)
+    finally:
+        _unregister(proc)
+    errors = proc.stderr.read() or ""
+    proc.stderr.close()
+    if proc.returncode != 0:
+        lines = [l for l in errors.splitlines() if l.strip()]
+        raise RuntimeError("joining the segments failed: " + (lines[-1] if lines else "ffmpeg error")[:240])
+    os.replace(part, path)
+    shutil.rmtree(work, ignore_errors=True)
+    size = os.path.getsize(path)
+    store.update(entry["id"], {"progress": 1.0, "total_bytes": size, "downloaded_bytes": size,
+                               "speed": 0, "error": None})
+    return True
+
+
 NETWORK_ERRORS = (urllib.error.URLError, socket.timeout, socket.error,
                   http.client.HTTPException, ConnectionError, TimeoutError)
 
@@ -578,13 +816,19 @@ def _transfer_with_retry(entry, stop):
     transferred. HLS restarts, so it gets fewer attempts.
     """
     is_hls = entry.get("stream_type", "http") != "http" or ".m3u8" in entry["source_url"]
-    attempts = 3 if is_hls else MAX_ATTEMPTS
+    attempts = MAX_ATTEMPTS                     # both resume now, so both get the full ladder
     last_error = None
     attempt = 0
     while attempt < attempts:
         attempt += 1
         try:
-            completed = _hls_download(entry, stop) if is_hls else _http_download(entry, stop)
+            if is_hls:
+                try:
+                    completed = _hls_segment_download(entry, stop)
+                except hls_mirror.Unsupported:
+                    completed = _hls_download(entry, stop)   # odd stream: one-shot ffmpeg
+            else:
+                completed = _http_download(entry, stop)
             store.update(entry["id"], {"attempt": 0}, flush=False)
             return completed
         except Exception as exc:                   # noqa: BLE001 - classified below
@@ -600,7 +844,7 @@ def _transfer_with_retry(entry, stop):
                 if switched:
                     entry = switched
                     is_hls = True
-                    attempt, attempts = 0, 3       # the stream starts fresh
+                    attempt, attempts = 0, MAX_ATTEMPTS
                     continue
             delay = min(2 ** attempt, BACKOFF_CAP)
             store.update(entry["id"], {
@@ -739,6 +983,81 @@ def check_integrity(path, timeout=900):
     return sum(1 for line in proc.stderr.splitlines() if line.strip())
 
 
+def probe_media(path):
+    """Length in seconds and which kinds of stream the file holds (from ffmpeg -i)."""
+    ffmpeg = which_ffmpeg()
+    if not ffmpeg or not os.path.exists(path):
+        return None
+    try:
+        proc = subprocess.run([ffmpeg, "-hide_banner", "-i", path], stdout=subprocess.DEVNULL,
+                              stderr=subprocess.PIPE, text=True, timeout=60)
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    info = proc.stderr
+    length = re.search(r"Duration: (\d+):(\d+):(\d+(?:\.\d+)?)", info)
+    seconds = (int(length.group(1)) * 3600 + int(length.group(2)) * 60 + float(length.group(3))) if length else None
+    return {"seconds": seconds, "video": " Video: " in info, "audio": " Audio: " in info}
+
+
+def fmt_clock(seconds):
+    seconds = int(round(seconds or 0))
+    h, rest = divmod(seconds, 3600)
+    m, s = divmod(rest, 60)
+    return "%d:%02d:%02d" % (h, m, s) if h else "%d:%02d" % (m, s)
+
+
+def completeness_problem(path, expected_seconds, strict=True):
+    """None when the file is whole; otherwise what is wrong, in plain words.
+
+    A download that stopped early can still parse cleanly, so the parse check
+    alone cannot tell. The reference should be the *stream's* length - the sum
+    of its segment durations - which is exact (strict: within 1%, 30s slack).
+    The API's episode length is not: it runs up to minutes longer than what is
+    actually served, so it is only good for a loose check (10%, 60s slack).
+    """
+    media = probe_media(path)
+    if media is None:
+        return None                              # cannot check (no ffmpeg): no verdict
+    if not media["video"]:
+        return "the file has no video"
+    if not media["audio"]:
+        return "the file has no sound"
+    if media["seconds"] is None:
+        return "the file has no readable length"
+    expected = float(expected_seconds or 0)
+    if expected > 0:
+        short = expected - media["seconds"]
+        slack = max(30.0, expected * 0.01) if strict else max(60.0, expected * 0.10)
+        if short > slack:
+            return "only %s of %s was downloaded" % (fmt_clock(media["seconds"]), fmt_clock(expected))
+    return None
+
+
+def stream_seconds_for(entry):
+    """Exact length of the stream this entry downloads, looked up once and kept."""
+    if entry.get("stream_seconds"):
+        return entry["stream_seconds"]
+    try:
+        stream = _lookup_stream(entry)           # a fresh link for its quality
+        if not stream:
+            return None
+        plan = _resolve_plan(dict(entry, source_url=stream))
+        seconds = sum(seg["duration"] for seg in plan["video"]["segments"])
+    except Exception:                           # noqa: BLE001 - offline, odd stream
+        return None
+    if seconds:
+        store.update(entry["id"], {"stream_seconds": seconds}, flush=False)
+    return seconds or None
+
+
+def expected_length(entry, allow_lookup=True):
+    """(seconds, strict) - the stream's length if known, else the API's, loosely."""
+    seconds = entry.get("stream_seconds") or (stream_seconds_for(entry) if allow_lookup else None)
+    if seconds:
+        return seconds, True
+    return entry.get("duration"), False
+
+
 def is_damaged(path):
     errors = check_integrity(path)
     return errors is not None and errors > INTEGRITY_ERROR_LIMIT
@@ -755,11 +1074,17 @@ def verify_one(entry_id):
     errors = check_integrity(path)
     if errors is None:
         return {"damaged": None, "errors": None}
-    damaged = errors > INTEGRITY_ERROR_LIMIT
-    store.update(entry_id, {"damaged": damaged, "verified_at": time.time()})
-    return {"damaged": damaged, "errors": errors}
+    expected, strict = expected_length(entry)
+    problem = "the video data is damaged" if errors > INTEGRITY_ERROR_LIMIT else \
+        completeness_problem(path, expected, strict)
+    media = probe_media(path) or {}
+    store.update(entry_id, {"damaged": bool(problem), "problem": problem,
+                            "verified_at": time.time(), "verified_seconds": media.get("seconds")})
+    return {"damaged": bool(problem), "problem": problem, "errors": errors,
+            "seconds": media.get("seconds"), "expected": expected, "strict": strict}
 
 
+LOOKUP_SPACING = 4.0           # seconds between stream-length lookups during a scan
 _verify_state = {"running": False, "checked": 0, "total": 0, "damaged": 0}
 
 
@@ -778,11 +1103,17 @@ def verify_library():
                     _verify_state["checked"] += 1
                     continue
                 store.update(entry["id"], {"verifying": True}, flush=False)
-                damaged = is_damaged(path)
-                if damaged:
+                if not entry.get("stream_seconds"):
+                    # this one looks its stream length up online: pace those, or
+                    # the CDN starts answering 403 to a burst of playlist fetches
+                    wait = LOOKUP_SPACING - (time.time() - _verify_state.get("last_lookup", 0))
+                    if wait > 0:
+                        time.sleep(wait)
+                    _verify_state["last_lookup"] = time.time()
+                result = verify_one(entry["id"]) or {}
+                if result.get("damaged"):
                     _verify_state["damaged"] += 1
-                store.update(entry["id"], {"verifying": False, "damaged": bool(damaged),
-                                           "verified_at": time.time()})
+                store.update(entry["id"], {"verifying": False})
                 _verify_state["checked"] += 1
         finally:
             _verify_state["running"] = False
@@ -816,20 +1147,28 @@ def _run_entry(entry_id, control):
             else:
                 store.update(entry_id, {"status": "paused", "speed": 0})
             return
-        store.update(entry_id, {"error": "Checking the file…", "speed": 0}, flush=False)
-        if is_damaged(human_path(entry)):
-            # keep it out of the library; ↻ throws the file away and refetches
+        store.update(entry_id, {"error": "Checking the file is complete…", "speed": 0}, flush=False)
+        final = human_path(entry)
+        entry = store.get(entry_id) or entry     # the mirror recorded the stream length
+        expected, strict = expected_length(entry, allow_lookup=False)
+        problem = "the video data is damaged" if is_damaged(final) else \
+            completeness_problem(final, expected, strict)
+        if problem:
+            # keep it out of the library; ⟳/↻ fetch it again
             store.update(entry_id, {
-                "status": "error", "speed": 0, "progress": 0.0, "attempt": 0, "damaged": True,
-                "error": "The downloaded file is damaged and will not play - press ↻ to download it again.",
+                "status": "error", "speed": 0, "progress": 0.0, "attempt": 0,
+                "damaged": True, "problem": problem,
+                "error": "Not saved: %s. Press ⟳ to download it again." % problem,
             })
             return
+        media = probe_media(final) or {}
         subs = []
         if config.get("download_subtitles"):
             subs = download_subtitles(entry, entry.get("pending_subtitles"))
         store.update(entry_id, {
             "status": "done", "speed": 0, "progress": 1.0, "error": None, "attempt": 0,
-            "damaged": False, "verified_at": time.time(),
+            "damaged": False, "problem": None, "verified_at": time.time(),
+            "verified_seconds": media.get("seconds"),
             "finished_at": time.time(), "subtitles": subs, "pending_subtitles": None,
         })
     except Exception as exc:                       # noqa: BLE001 - surfaced in the UI
@@ -894,6 +1233,24 @@ def pause(entry_id):
     return False
 
 
+def pause_all():
+    """Pause everything queued or downloading; they stay paused across restarts."""
+    count = 0
+    for entry in store.all_entries():
+        if entry.get("status") in ("queued", "downloading") and pause(entry["id"]):
+            count += 1
+    return count
+
+
+def resume_all():
+    """Resume everything paused and try every failed download again."""
+    count = 0
+    for entry in store.all_entries():
+        if entry.get("status") in ("paused", "error") and resume(entry["id"]):
+            count += 1
+    return count
+
+
 def _refresh_source(entry_id):
     """Swap in a freshly issued stream link. Best effort: offline keeps the old one.
 
@@ -942,6 +1299,7 @@ def restart(entry_id):
             time.sleep(0.05)
 
     path = human_path(entry)
+    shutil.rmtree(work_dir(entry), ignore_errors=True)     # start over means from zero
     for partial in (path + ".part", os.path.splitext(path)[0] + ".part.mp4", path):
         try:
             if os.path.exists(partial):
@@ -986,6 +1344,7 @@ def _cleanup_files(entry, keep_dir=False):
                 os.remove(candidate)
         except OSError:
             pass
+    shutil.rmtree(work_dir(entry), ignore_errors=True)
     for sub in entry.get("subtitles") or []:
         try:
             os.remove(os.path.join(os.path.dirname(path), sub["file"]))

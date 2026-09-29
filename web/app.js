@@ -1703,7 +1703,40 @@ let libraryActiveKey = null;
 let libraryDoneCount = -1;
 let libraryRendering = false;
 
+/* Pause all / Resume all live in the "Downloading" heading and are kept in
+   step with the queue on every poll. */
+let bulkButtons = null;
+
+function bulkControls() {
+  const call = (path, verb) => async () => {
+    try {
+      const result = await local.post(path);
+      const n = result.paused !== undefined ? result.paused : result.resumed;
+      toast(n ? `${verb} ${n} download${n === 1 ? '' : 's'}` : 'Nothing to change', 'ok');
+      refreshDownloads();
+    } catch (error) { toast(error.message, 'err'); }
+  };
+  const pause = el('button', { class: 'btn small', title: 'Pause every download — they stay paused, even after a restart' },
+    '❚❚ Pause all');
+  pause.addEventListener('click', call('/downloads/pause-all', 'Paused'));
+  const resume = el('button', { class: 'btn small', title: 'Resume paused downloads and try failed ones again' },
+    '▶︎ Resume all');
+  resume.addEventListener('click', call('/downloads/resume-all', 'Resumed'));
+  bulkButtons = { pause, resume };
+  paintBulk();
+  return el('span', { class: 'bulk' }, pause, resume);
+}
+
+function paintBulk() {
+  if (!bulkButtons) return;
+  const running = State.downloads.some((e) => e.status === 'downloading' || e.status === 'queued');
+  const stopped = State.downloads.some((e) => e.status === 'paused' || e.status === 'error');
+  bulkButtons.pause.disabled = !running;
+  bulkButtons.resume.disabled = !stopped;
+}
+
 function refreshLibraryInPlace() {
+  paintBulk();
   const active = State.downloads.filter((e) => e.status !== 'done');
   const key = active.map((e) => e.id).join(',');
   const doneCount = State.downloads.filter((e) => e.status === 'done').length;
@@ -1746,6 +1779,23 @@ function globalSpeedPicker() {
   }, choices.map(([value, label]) => el('option', { value, selected: value === current }, label)));
 }
 
+/* How a saved file stands: checked complete, broken, or not checked yet. */
+function fileStatus(entry) {
+  if (entry.available === false) {
+    return el('span', { class: 'dur', style: 'color:var(--err)' }, 'file deleted');
+  }
+  if (entry.damaged) {
+    const cut = /only .* was downloaded/.test(entry.problem || '');
+    return el('span', { class: 'dur', style: 'color:var(--err)', title: entry.problem || 'The file will not play' },
+      cut ? '⚠ incomplete' : '⚠ damaged');
+  }
+  if (entry.verified_seconds) {
+    return el('span', { class: 'dur dlstate done', title: 'Checked: the whole video is there' },
+      `✓ complete · ${duration(entry.verified_seconds)}`);
+  }
+  return el('span', { class: 'dur dlstate done', title: 'Not checked yet — press 🔍' }, '✓ saved');
+}
+
 /** Check / download again / delete for one file on disk. */
 function savedFileActions(entry, afterChange) {
   const verify = el('button', {
@@ -1758,10 +1808,13 @@ function savedFileActions(entry, afterChange) {
         if (result.missing) toast('The file is missing from disk', 'err');
         else if (result.damaged === null) toast('Could not check the file — is ffmpeg installed?', 'err');
         else {
-          const changed = !!entry.damaged !== !!result.damaged;
           entry.damaged = result.damaged;
-          toast(result.damaged ? 'Damaged — download it again with ↻' : 'File is intact ✓', result.damaged ? 'err' : 'ok');
-          if (changed && afterChange) afterChange();
+          entry.problem = result.problem;
+          entry.verified_seconds = result.seconds;
+          toast(result.damaged
+            ? `Not playable: ${result.problem}. Download it again with ↻`
+            : `Complete ✓ — the whole ${duration(result.seconds)} is there`, result.damaged ? 'err' : 'ok');
+          if (afterChange) afterChange();
         }
       } catch (error) { toast(error.message, 'err'); }
       verify.disabled = false;
@@ -1809,10 +1862,8 @@ function showFilmSheet(entry) {
         [entry.quality, bytes(entry.total_bytes), entry.year].filter(Boolean).join(' · ')),
       el('div', { class: 'episodes' },
         el('div', { class: 'episode' },
-          el('span', { class: 'name' }, entry.damaged ? 'This file is damaged and will not play' : 'Saved on this Mac'),
-          entry.damaged
-            ? el('span', { class: 'dur', style: 'color:var(--err)' }, '⚠ damaged')
-            : el('span', { class: 'dur dlstate done' }, '✓ saved'),
+          el('span', { class: 'name' }, entry.damaged ? `Will not play: ${entry.problem || 'the file is damaged'}` : 'Saved on this Mac'),
+          fileStatus(entry),
           entry.damaged ? null : el('button', {
             class: 'btn small primary', title: 'Play from disk',
             onclick: () => { close(); playLibraryEntry(entry); },
@@ -1843,8 +1894,9 @@ async function viewLibrary(options) {
     // in progress: the same live rows the Downloads page had
     downloadRows = new Map();
     downloadLayout = '';                         // Downloads rebuilds if visited
+    bulkButtons = null;
     const inProgress = active.length ? el('div', { class: 'inprogress' },
-      el('h2', {}, `⬇️ Downloading (${active.length})`),
+      el('h2', {}, `⬇️ Downloading (${active.length})`, bulkControls()),
       active.map((entry) => {
         const row = downloadRow(entry);
         downloadRows.set(entry.id, row);
@@ -1865,7 +1917,7 @@ async function viewLibrary(options) {
       const poster = { medium: first.poster_file ? '/poster/' + first.poster_file : '' };
       if (!first.season) {                       // a film: plays on click, ⋯ manages it
         blocks.push(card({ id: first.item_id, title: first.title, year: first.year, posters: poster }, {
-          badge: first.damaged ? '⚠ damaged' : first.quality,
+          badge: first.damaged ? '⚠ not playable' : first.quality,
           meta: bytes(first.total_bytes),
           progress: first.position && first.duration ? Math.min(first.position / first.duration, 1) : 0,
           onclick: () => (first.damaged ? showFilmSheet(first) : playLibraryEntry(first)),
@@ -1874,7 +1926,7 @@ async function viewLibrary(options) {
       } else {                                   // a series: opens its episode sheet
         blocks.push(card({ id: first.item_id, title: name, year: first.year, posters: poster }, {
           badge: list.some((e) => e.damaged)
-            ? `⚠ ${list.filter((e) => e.damaged).length} damaged`
+            ? `⚠ ${list.filter((e) => e.damaged).length} not playable`
             : `${list.length} ${list.length === 1 ? 'ep' : 'eps'}`,
           meta: bytes(list.reduce((sum, e) => sum + (e.total_bytes || 0), 0)),
           onclick: () => showLibraryGroup(name, list),
@@ -1912,7 +1964,7 @@ async function viewLibrary(options) {
         entries.length ? verifyButton(entries) : null,
         globalSpeedPicker()),
       damagedCount ? el('div', { class: 'banner err' },
-        `⚠️ ${damagedCount} downloaded ${damagedCount === 1 ? 'file is' : 'files are'} damaged and will not play — press ↻ on it to download again.`) : null,
+        `⚠️ ${damagedCount} downloaded ${damagedCount === 1 ? 'file is' : 'files are'} damaged or incomplete and will not play properly — press ↻ on it to download again.`) : null,
       inProgress,
       shelf);
   } catch (error) {
@@ -1924,7 +1976,7 @@ async function viewLibrary(options) {
 
 /** Check every downloaded file parses cleanly; damaged ones get flagged. */
 function verifyButton(entries) {
-  const button = el('button', { class: 'btn small ghost', title: 'Parse every file to find damaged downloads' },
+  const button = el('button', { class: 'btn small ghost', title: 'Check every file is undamaged and the full length' },
     '🔍 Verify files');
   button.addEventListener('click', async () => {
     try {
@@ -1935,7 +1987,7 @@ function verifyButton(entries) {
         const v = data.verify || {};
         button.textContent = `🔍 Checking ${v.checked}/${v.total}…`;
         if (v.running) return setTimeout(poll, 1500);
-        toast(v.damaged ? `${v.damaged} damaged file${v.damaged === 1 ? '' : 's'} found` : 'All files are fine', v.damaged ? 'err' : 'ok');
+        toast(v.damaged ? `${v.damaged} file${v.damaged === 1 ? ' is' : 's are'} damaged or incomplete` : `All ${v.total} files are complete ✓`, v.damaged ? 'err' : 'ok');
         viewLibrary();
       };
       poll();
@@ -1965,11 +2017,7 @@ function showLibraryGroup(name, list) {
 
   // status, play (unless damaged), then check / download again / delete
   const savedControls = (entry) => [
-    entry.available === false
-      ? el('span', { class: 'dur', style: 'color:var(--err)' }, 'file deleted')
-      : entry.damaged
-        ? el('span', { class: 'dur', style: 'color:var(--err)' }, '⚠ damaged')
-        : el('span', { class: 'dur dlstate done' }, '✓ saved'),
+    fileStatus(entry),
     entry.damaged || entry.available === false ? null
       : el('button', { class: 'btn small primary', title: 'Play from disk', onclick: () => { close(); playLibraryEntry(entry); } }, '▶︎'),
     ...savedFileActions(entry, afterChange),

@@ -198,6 +198,8 @@ class Handler(BaseHTTPRequestHandler):
             ("POST", "/reveal"): routes.reveal,
             ("POST", "/library/verify"): routes.library_verify,
             ("POST", "/cache/warm"): routes.cache_warm,
+            ("POST", "/downloads/pause-all"): routes.downloads_pause_all,
+            ("POST", "/downloads/resume-all"): routes.downloads_resume_all,
             ("GET", "/library/verify"): routes.library_verify_status,
             ("POST", "/quit"): lambda _p, _b: (shutdown_soon(), {"stopping": True})[1],
         }
