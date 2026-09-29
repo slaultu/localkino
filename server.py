@@ -165,6 +165,10 @@ class Handler(BaseHTTPRequestHandler):
         if path.startswith("/kp/"):
             return self._json(routes.kp_proxy(path[len("/kp/"):], params, method, body))
 
+        match = re.match(r"^/cache/items/(\d+)$", path)
+        if match and method == "GET":
+            return self._json(routes.cached_item(match.group(1), params, body))
+
         match = re.match(r"^/downloads/([0-9a-f]+)/verify$", path)
         if match and method == "POST":
             return self._json(routes.downloads_verify(match.group(1), body))
@@ -193,6 +197,7 @@ class Handler(BaseHTTPRequestHandler):
             ("GET", "/library"): routes.library_list,
             ("POST", "/reveal"): routes.reveal,
             ("POST", "/library/verify"): routes.library_verify,
+            ("POST", "/cache/warm"): routes.cache_warm,
             ("GET", "/library/verify"): routes.library_verify_status,
             ("POST", "/quit"): lambda _p, _b: (shutdown_soon(), {"stopping": True})[1],
         }

@@ -518,9 +518,12 @@ def _lookup_stream(entry):
     if not item_id:
         return None
     try:
-        item = (api.call("items/%s" % item_id) or {}).get("item") or {}
+        payload = api.call("items/%s" % item_id) or {}
     except api.ApiError:
         return None
+    from . import item_cache
+    item_cache.save(item_id, payload)
+    item = payload.get("item") or {}
     medias = list(item.get("videos") or [])
     for season in item.get("seasons") or []:
         medias.extend(season.get("episodes") or [])

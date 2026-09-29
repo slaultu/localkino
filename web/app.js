@@ -691,10 +691,31 @@ function downloadBadgeText(entry) {
 
 let repaintItemDownloads = null;
 
+/* A film or series with every episode. Online it comes from the API (and the
+   server keeps a copy); offline, or when the API does not answer, the kept
+   copy is used so the full episode list is still there. */
+async function itemWithCache(id) {
+  if (navigator.onLine) {
+    try {
+      return await kp('items/' + id);
+    } catch (error) {
+      if (error.status === 401) throw error;
+    }
+  }
+  return local.get('/cache/items/' + id);        // 404 when never seen
+}
+
+function cachedNote(data) {
+  if (!data || !data._cached_at) return null;
+  const hours = (Date.now() / 1000 - data._cached_at) / 3600;
+  const when = hours < 1 ? 'less than an hour ago' : hours < 48 ? `${Math.round(hours)} h ago` : `${Math.round(hours / 24)} days ago`;
+  return el('div', { class: 'banner' }, `✈️ Offline — episode list as saved ${when}. Downloaded episodes play; the rest need internet.`);
+}
+
 async function viewItem(id) {
   loading();
   try {
-    const data = await kp('items/' + id);
+    const data = await itemWithCache(id);
     const item = data.item || {};
     const medias = mediaList(item);
     const isSerial = !!(item.seasons && item.seasons.length);
@@ -704,12 +725,13 @@ async function viewItem(id) {
       const media = medias[0];
       if (!media) return toast('No files available', 'err');
       const saved = downloadStateFor(media.media_id);
-      if (saved && saved.status === 'done') return playLibraryEntry(saved);
+      if (saved && saved.status === 'done' && !saved.damaged) return playLibraryEntry(saved);
       const file = pickFile(media.files, preferred);
       openPlayer({
         url: fileUrl(file, State.settings.stream_type || 'http'),
         urls: (file || {}).url || (file || {}).urls || {},
         title: item.title,
+        quality: qualityLabel((file || {}).quality),
         subtitle: media.season ? `S${media.season}E${media.episode} · ${file.quality}` : file.quality,
         itemId: item.id, season: media.season, video: media.episode || media.index || 1,
         position: (media.watching || {}).time || 0,
@@ -845,6 +867,7 @@ async function viewItem(id) {
           url: fileUrl(file, State.settings.stream_type || 'http'),
           urls: (file || {}).url || (file || {}).urls || {},
           title: item.title,
+          quality: qualityLabel((file || {}).quality),
           subtitle: one.season ? `S${one.season}E${one.episode} · ${(file || {}).quality || ''}` : (file || {}).quality || '',
           itemId: item.id, season: one.season, video: one.episode || one.index || 1,
           position: (one.watching || {}).time || 0,
@@ -899,7 +922,7 @@ async function viewItem(id) {
       seasonBlocks.push(el('div', { class: 'episodes' }, medias.map(episodeRow)));
     }
 
-    setView(hero, seasonBlocks);
+    setView(cachedNote(data), hero, seasonBlocks);
     repaintItemDownloads = () => painters.forEach((paintOne) => paintOne());
   } catch (error) {
     setView(errorView(error));
@@ -909,6 +932,7 @@ async function viewItem(id) {
 /* ------------------------------------------------------------------ player */
 let playerTimer = null;
 let playerKeys = null;
+let playerInfoTimer = null;
 let activeHls = null;
 
 /* Audio tracks live inside the file itself, so the browser does the switching.
@@ -1212,12 +1236,38 @@ function openPlayer(options) {
   const retryButton = el('button', { class: 'btn small primary' }, '⟳ Reconnect');
   const banner = el('div', { class: 'player-stall', hidden: 'hidden' }, bannerText, retryButton);
 
+  // live readout: what is playing, how fast it arrives, and where from
+  const info = el('button', { class: 'player-info linklike', type: 'button' }, '');
+  if (options.entryId) {
+    info.addEventListener('click', () => local.post('/reveal', { entry_id: options.entryId }).catch(() => {}));
+  }
+  const paintInfo = () => {
+    const parts = [];
+    const level = hls && hls.levels && hls.levels.length
+      ? hls.levels[hls.currentLevel >= 0 ? hls.currentLevel : Math.max(hls.loadLevel, 0)] : null;
+    if (level && level.height) parts.push(level.height + 'p');
+    else if (options.quality) parts.push(options.quality);
+    if (!options.entryId) {
+      const estimate = hls ? hls.bandwidthEstimate : 0;     // bits per second
+      if (estimate) parts.push(`↓ ${bytes(estimate / 8)}/s`);
+      const ahead = bufferedAhead(video);
+      if (ahead !== null) parts.push(`buffer ${Math.round(ahead)}s`);
+      parts.push('🌐 ' + (streamHost(level, video) || 'streaming'));
+      info.title = 'Streaming. Speed is the current estimate; buffer is how much is loaded ahead.';
+    } else {
+      parts.push('💾 ' + (options.localPath || 'on this Mac'));
+      info.title = (options.localPath || '') + ' — click to show it in Finder';
+    }
+    info.textContent = parts.join(' · ');
+  };
+
   const overlay = el('div', { class: 'player-overlay' }, video, banner,
     el('div', { class: 'player-bar' },
       el('button', { class: 'btn ghost small', onclick: closePlayer }, '✕ Close'),
       el('div', {}, el('div', { class: 'player-title' }, options.title || ''),
         el('div', { class: 'player-sub' }, options.subtitle || '')),
       el('div', { style: 'margin-left:auto;display:flex;gap:8px;align-items:center' },
+        info,
         audioSelector(video, options.audios, () => hls, engageHlsForAudio),
         el('button', { class: 'btn small', onclick: () => { video.currentTime = Math.max(0, video.currentTime - 30); } }, '↺ 30s'),
         el('button', { class: 'btn small', onclick: () => { video.currentTime += 30; } }, '30s ↻'),
@@ -1268,6 +1318,8 @@ function openPlayer(options) {
     }
   };
   playerTimer = setInterval(save, 20000);
+  paintInfo();
+  playerInfoTimer = setInterval(paintInfo, 1000);
   video.addEventListener('pause', save);
   overlay.addEventListener('remove', save);
   // --- live-stream recovery -------------------------------------------
@@ -1367,7 +1419,29 @@ function openPlayer(options) {
 
 function escClose(event) { if (event.key === 'Escape') closePlayer(); }
 
+function bufferedAhead(video) {
+  const now = video.currentTime;
+  for (let i = 0; i < video.buffered.length; i += 1) {
+    if (video.buffered.start(i) <= now + 0.5 && video.buffered.end(i) >= now) {
+      return video.buffered.end(i) - now;
+    }
+  }
+  return video.buffered.length ? 0 : null;
+}
+
+function streamHost(level, video) {
+  const url = (level && level.url && level.url[0]) || video.currentSrc || '';
+  try {
+    const host = new URL(url).hostname;
+    const cdn = host.match(/(ams-static-\d+|[a-z]+-static-\d+)/);
+    return cdn ? cdn[1] : host;
+  } catch (_) {
+    return '';
+  }
+}
+
 function closePlayer() {
+  if (playerInfoTimer) { clearInterval(playerInfoTimer); playerInfoTimer = null; }
   while (hlsBlobUrls.length) {
     try { URL.revokeObjectURL(hlsBlobUrls.pop()); } catch (_) { /* ignore */ }
   }
@@ -1596,6 +1670,8 @@ function playLibraryEntry(entry) {
     subtitle: [entry.season ? `S${entry.season}E${entry.episode}` : null, entry.quality, 'offline'].filter(Boolean).join(' · '),
     position: entry.position || 0,
     duration: entry.duration,
+    quality: entry.quality,
+    localPath: ((State.settings.library_dir || '') + '/' + entry.rel_path).replace(/^\/Users\/[^/]+/, '~'),
     entryId: entry.id,
     subtitles,
   });
@@ -1804,6 +1880,11 @@ async function viewLibrary(options) {
         el('button', { class: 'btn primary', onclick: () => { location.hash = '#/home'; } }, 'Browse catalog'));
     }
 
+    if (!quiet && navigator.onLine) {
+      const seriesIds = [...new Set(entries.concat(active).filter((e) => e.season && e.item_id).map((e) => e.item_id))];
+      if (seriesIds.length) local.post('/cache/warm', { ids: seriesIds }).catch(() => {});
+    }
+
     (quiet ? setViewKeepingScroll : setView)(
       el('h1', {}, 'Offline'),
       el('p', { class: 'subtitle' }, summary),
@@ -1875,6 +1956,33 @@ function showLibraryGroup(name, list) {
     ...savedFileActions(entry, afterChange),
   ];
 
+  // an unfinished download in the sheet: status, then what can be done about it
+  const queueControls = (entry) => {
+    const act = (name, label, title, cls) => el('button', {
+      class: 'btn small ' + (cls || ''), title,
+      onclick: async () => {
+        if (name === 'delete' && !await confirmAction('Delete download?',
+          `“${entry.title}” will be removed, along with anything downloaded so far.`, 'Delete')) return;
+        if (name === 'restart' && entry.downloaded_bytes && !await confirmAction('Start over?',
+          `What has been downloaded of “${entry.title}” (${bytes(entry.downloaded_bytes)}) is thrown away.`, 'Start over')) return;
+        try {
+          await local.post(`/downloads/${entry.id}/${name}`);
+          afterChange();
+          refreshDownloads();
+        } catch (error) { toast(error.message, 'err'); }
+      },
+    }, label);
+    const status = entry.status;
+    return [
+      el('span', { class: 'dur dlstate ' + status, title: entry.error || '' }, downloadBadgeText(entry)),
+      status === 'downloading' || status === 'queued' ? act('pause', '❚❚', 'Pause') : null,
+      status === 'paused' ? act('resume', '▶︎', 'Resume') : null,
+      status === 'error' ? act('retry', '⟳', 'Try again' + (entry.error ? ' — ' + entry.error : '')) : null,
+      status !== 'queued' ? act('restart', '↻', 'Start over from zero') : null,
+      act('delete', '🗑', 'Delete', 'danger'),
+    ];
+  };
+
   const savedRow = (entry) => el('div', { class: 'episode' },
     el('span', { class: 'num' }, entry.season ? `${entry.season}×${String(entry.episode).padStart(2, '0')}` : '▶︎'),
     el('span', { class: 'name' }, entry.episode_title || entry.title),
@@ -1888,10 +1996,10 @@ function showLibraryGroup(name, list) {
   };
   renderSavedOnly();
 
-  if (!itemId || !navigator.onLine) return;
+  if (!itemId) return;
 
-  // online: the whole series, so the gaps are visible
-  kp('items/' + itemId).then((data) => {
+  // the whole series - live, or the kept copy when offline - so the gaps show
+  itemWithCache(itemId).then((data) => {
     const item = data.item || {};
     const medias = mediaList(item);
     if (!medias.length) return;
@@ -1901,7 +2009,8 @@ function showLibraryGroup(name, list) {
 
     body.textContent = '';
     const savedCount = medias.filter((m) => savedByMedia.has(String(m.media_id))).length;
-    note.textContent = `${savedCount} of ${medias.length} episodes downloaded`;
+    note.textContent = `${savedCount} of ${medias.length} episodes downloaded`
+      + (data._cached_at ? ' · offline, from the saved list' : '');
 
     let season = null;
     for (const media of medias) {
@@ -1920,7 +2029,7 @@ function showLibraryGroup(name, list) {
       if (saved) {
         savedControls(saved).forEach((node) => node && row.appendChild(node));
       } else if (queued && queued.status !== 'done') {
-        row.appendChild(el('span', { class: 'dur dlstate ' + queued.status }, downloadBadgeText(queued)));
+        queueControls(queued).forEach((node) => node && row.appendChild(node));
       } else {
         row.appendChild(el('span', { class: 'dur', style: 'opacity:.6' }, 'not downloaded'));
         row.appendChild(el('button', {

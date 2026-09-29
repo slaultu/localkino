@@ -258,3 +258,9 @@ select.btn { appearance: none; padding-right: 28px; background-image: linear-gra
 
 .inprogress { margin-bottom: 26px; }
 .inprogress h2 { margin-top: 6px; }
+
+.player-info {
+  font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums;
+  max-width: 38vw; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.player-info:hover { color: var(--text); }

@@ -1,11 +1,12 @@
 """JSON API used by the local web UI."""
 import os
+import re
 import subprocess
 import threading
 import urllib.parse
 import time
 
-from . import api, config, downloader, store
+from . import api, config, downloader, item_cache, store
 
 _device = {"code": None, "user_code": None, "verification_uri": None, "expires_at": 0, "interval": 5}
 _device_lock = threading.Lock()
@@ -100,11 +101,41 @@ def auth_logout(_params, _body):
 # --------------------------------------------------------------------------- #
 # transparent proxy to the kino.pub API
 # --------------------------------------------------------------------------- #
+ITEM_PATH = re.compile(r"^items/(\d+)$")
+
+
 def kp_proxy(path, params, method, body):
     clean = {k: v for k, v in params.items() if k != "_"}
     if method == "POST":
         return api.call(path, params=clean, method="POST", data=body or {})
-    return api.call(path, params=clean)
+    item = ITEM_PATH.match(path)
+    try:
+        data = api.call(path, params=clean)
+    except api.Offline:
+        # the network is gone: an item we have seen before is still worth showing
+        cached = item_cache.load(item.group(1)) if item else None
+        if not cached:
+            raise
+        data = dict(cached["data"])
+        data["_cached_at"] = cached["cached_at"]
+        return data
+    if item:
+        item_cache.save(item.group(1), data)
+    return data
+
+
+def cached_item(item_id, _params, _body):
+    cached = item_cache.load(item_id)
+    if not cached:
+        raise HttpError(404, "Not seen yet")
+    data = dict(cached["data"])
+    data["_cached_at"] = cached["cached_at"]
+    return data
+
+
+def cache_warm(_params, body):
+    """Keep copies of these items fresh, so they still show when offline."""
+    return {"refreshing": item_cache.warm(body.get("ids") or [])}
 
 
 # --------------------------------------------------------------------------- #

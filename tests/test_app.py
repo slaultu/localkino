@@ -566,3 +566,44 @@ class TestHlsCommand(unittest.TestCase):
         proc = subprocess.run(cmd[:-1] + ["-t", "1", cmd[-1]], capture_output=True, text=True, timeout=60)
         self.assertNotIn("not found", proc.stderr, proc.stderr)
         shutil.rmtree(tmp, ignore_errors=True)
+
+
+# --------------------------------------------------------------------------- #
+class TestItemCache(unittest.TestCase):
+    """A series seen once online still lists all its episodes offline."""
+
+    SHOW = {"item": {"id": 4242, "title": "Show", "seasons": [
+        {"number": 1, "episodes": [{"id": 1}, {"id": 2}, {"id": 3}]}]}}
+
+    def _with_api(self, fake, call):
+        real = api.call
+        api.call = fake
+        try:
+            return call()
+        finally:
+            api.call = real
+
+    @staticmethod
+    def _offline(*_args, **_kwargs):
+        raise api.Offline("no network")
+
+    def test_seen_item_is_served_from_the_copy_when_offline(self):
+        live = self._with_api(lambda *a, **k: self.SHOW,
+                              lambda: routes.kp_proxy("items/4242", {}, "GET", {}))
+        self.assertNotIn("_cached_at", live)
+        cached = self._with_api(self._offline, lambda: routes.kp_proxy("items/4242", {}, "GET", {}))
+        self.assertEqual(len(cached["item"]["seasons"][0]["episodes"]), 3)
+        self.assertIn("_cached_at", cached)
+        self.assertEqual(routes.cached_item("4242", {}, {})["item"]["title"], "Show")
+
+    def test_never_seen_item_still_reports_offline(self):
+        with self.assertRaises(api.Offline):
+            self._with_api(self._offline, lambda: routes.kp_proxy("items/999999", {}, "GET", {}))
+        with self.assertRaises(routes.HttpError):
+            routes.cached_item("999999", {}, {})
+
+    def test_lists_are_not_kept(self):
+        self._with_api(lambda *a, **k: {"items": []},
+                       lambda: routes.kp_proxy("items/fresh", {"type": "movie"}, "GET", {}))
+        with self.assertRaises(api.Offline):
+            self._with_api(self._offline, lambda: routes.kp_proxy("items/fresh", {"type": "movie"}, "GET", {}))
