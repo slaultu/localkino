@@ -181,6 +181,10 @@ class Handler(BaseHTTPRequestHandler):
         if match and method == "POST":
             return self._json(routes.downloads_action(match.group(1), match.group(2)))
 
+        match = re.match(r"^/library/([0-9a-f]+)/glitch$", path)
+        if match and method == "POST":
+            return self._json(routes.library_glitch(match.group(1), body))
+
         match = re.match(r"^/library/([0-9a-f]+)/progress$", path)
         if match and method == "POST":
             return self._json(routes.library_progress(match.group(1), body))

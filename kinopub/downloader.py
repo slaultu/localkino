@@ -1058,6 +1058,38 @@ def expected_length(entry, allow_lookup=True):
     return entry.get("duration"), False
 
 
+DECODE_ERROR_LIMIT = 30         # decode errors a film may show before it counts as damaged
+
+
+def decode_errors(path, timeout=3 * 3600):
+    """Decode the whole file the way a player would; returns error lines, or None.
+
+    Parsing only proves the packets are well formed - garbage inside a packet
+    passes it and stops a browser mid-film. Decoding finds that. It is run at
+    the lowest CPU priority (about 40x realtime: a 2h film in ~3 min) so it
+    never gets in the way of watching.
+    """
+    ffmpeg = which_ffmpeg()
+    if not ffmpeg or not os.path.exists(path):
+        return None
+    try:
+        proc = subprocess.Popen(["nice", "-n", "19", ffmpeg, "-v", "error", "-i", path, "-f", "null", "-"],
+                                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+    except OSError:
+        return None
+    _register(proc)
+    try:
+        _out, err = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        return None
+    finally:
+        _unregister(proc)
+    if proc.returncode not in (0, None) and not err.strip():
+        return None                              # killed (shutdown) - no verdict
+    return sum(1 for line in err.splitlines() if line.strip())
+
+
 def is_damaged(path):
     errors = check_integrity(path)
     return errors is not None and errors > INTEGRITY_ERROR_LIMIT
@@ -1077,8 +1109,15 @@ def verify_one(entry_id):
     expected, strict = expected_length(entry)
     problem = "the video data is damaged" if errors > INTEGRITY_ERROR_LIMIT else \
         completeness_problem(path, expected, strict)
+    decoded = None
+    if not problem:
+        decoded = decode_errors(path)
+        if decoded is not None and decoded > DECODE_ERROR_LIMIT:
+            problem = "the picture is corrupted in many places"
     media = probe_media(path) or {}
     store.update(entry_id, {"damaged": bool(problem), "problem": problem,
+                            "decode_errors": decoded,
+                            "decoded_at": time.time() if decoded is not None else entry.get("decoded_at"),
                             "verified_at": time.time(), "verified_seconds": media.get("seconds")})
     return {"damaged": bool(problem), "problem": problem, "errors": errors,
             "seconds": media.get("seconds"), "expected": expected, "strict": strict}
@@ -1091,7 +1130,8 @@ _verify_state = {"running": False, "checked": 0, "total": 0, "damaged": 0}
 def _needs_check(entry):
     """Unchecked, or changed on disk since its last check."""
     try:
-        return not entry.get("verified_at") or os.path.getmtime(human_path(entry)) > entry["verified_at"]
+        return (not entry.get("verified_at") or not entry.get("decoded_at")
+                or os.path.getmtime(human_path(entry)) > entry["verified_at"])
     except OSError:
         return False
 
@@ -1162,6 +1202,12 @@ def _run_entry(entry_id, control):
         expected, strict = expected_length(entry, allow_lookup=False)
         problem = "the video data is damaged" if is_damaged(final) else \
             completeness_problem(final, expected, strict)
+        decoded = None
+        if not problem:
+            store.update(entry_id, {"error": "Checking every frame plays…"}, flush=False)
+            decoded = decode_errors(final)
+            if decoded is not None and decoded > DECODE_ERROR_LIMIT:
+                problem = "the picture is corrupted in many places"
         if problem:
             # keep it out of the library; ⟳/↻ fetch it again
             store.update(entry_id, {
@@ -1177,6 +1223,7 @@ def _run_entry(entry_id, control):
         store.update(entry_id, {
             "status": "done", "speed": 0, "progress": 1.0, "error": None, "attempt": 0,
             "damaged": False, "problem": None, "verified_at": time.time(),
+            "decode_errors": decoded, "decoded_at": time.time() if decoded is not None else None,
             "verified_seconds": media.get("seconds"),
             "finished_at": time.time(), "subtitles": subs, "pending_subtitles": None,
         })

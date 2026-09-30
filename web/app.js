@@ -1283,14 +1283,36 @@ function openPlayer(options) {
       video.currentTime = at;
       toast(`Resuming from ${duration(at)}`);
     }
-  });
+  }, { once: true });                      // a reload after a damaged spot must not jump back
+
+  /* A damaged spot in a local file stops the browser's decoder for good. Reload
+     and carry on a little past it - a few lost seconds beat a dead film on a
+     plane. Past a handful of spots the file is too broken: stream instead. */
+  let goodUntil = 0;
+  let skips = 0;
+  video.addEventListener('timeupdate', () => { if (!video.error && video.currentTime) goodUntil = video.currentTime; });
+  const skipDamage = () => {
+    skips += 1;
+    const at = goodUntil + 2 * skips;
+    local.post(`/library/${options.entryId}/glitch`, { at, fatal: skips > 6 }).catch(() => {});
+    if (skips > 6) {
+      if (navigator.onLine && options.itemId) return streamInstead(options, at);
+      return toast('This file is too damaged to play. Re-download it (Offline → ↻) when you have internet.', 'err');
+    }
+    toast(`Skipped a damaged spot at ${duration(at)}`);
+    video.src = options.url;
+    video.load();
+    video.addEventListener('loadedmetadata', () => {
+      video.currentTime = Math.min(at, (video.duration || at + 1) - 1);
+      video.play().catch(() => {});
+    }, { once: true });
+    return undefined;
+  };
   video.addEventListener('error', () => {
     const hls = String(options.url).includes('.m3u8');
     if (options.entryId) {
       const code = (video.error || {}).code;
-      if (code === 3) {                        // MEDIA_ERR_DECODE
-        return toast('This file is damaged and cannot be played. Re-download it: Offline → ↻', 'err');
-      }
+      if (code === 3) return skipDamage();    // MEDIA_ERR_DECODE: a damaged spot
       if (code === 4) {                        // MEDIA_ERR_SRC_NOT_SUPPORTED
         return toast('The browser cannot play this format. QuickTime or VLC may.', 'err');
       }
@@ -1417,6 +1439,26 @@ function openPlayer(options) {
 }
 
 function escClose(event) { if (event.key === 'Escape') closePlayer(); }
+
+/* Play the same video over the network from `at`, when the local copy fails. */
+async function streamInstead(options, at) {
+  try {
+    const entry = State.downloads.find((e) => e.id === options.entryId) || {};
+    const data = await kp('items/' + options.itemId);
+    const media = mediaList(data.item || {}).find((m) => String(m.media_id) === String(entry.media_id));
+    const file = media && pickFile(media.files, entry.quality);
+    if (!file) throw new Error('no stream');
+    toast('The file is damaged here — continuing online', 'err');
+    openPlayer({
+      url: fileUrl(file, 'http'), urls: file.url || {}, title: options.title,
+      quality: qualityLabel(file.quality), subtitle: (options.subtitle || '').replace('offline', 'online'),
+      itemId: options.itemId, season: entry.season, video: entry.episode || 1,
+      position: at, duration: media.duration, subtitles: chooseSubtitles(media.subtitles), audios: media.audios,
+    });
+  } catch (_) {
+    toast('This file is too damaged to play, and it could not be streamed.', 'err');
+  }
+}
 
 function bufferedAhead(video) {
   const now = video.currentTime;
@@ -1628,6 +1670,7 @@ function playLibraryEntry(entry) {
     position: entry.position || 0,
     duration: entry.duration,
     quality: entry.quality,
+    itemId: entry.item_id,
     localPath: ((State.settings.library_dir || '') + '/' + entry.rel_path).replace(/^\/Users\/[^/]+/, '~'),
     entryId: entry.id,
     subtitles,

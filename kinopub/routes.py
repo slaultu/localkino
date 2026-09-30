@@ -332,6 +332,20 @@ def library_verify_status(_params, _body):
     return {"verify": downloader.verify_status()}
 
 
+def library_glitch(entry_id, body):
+    """The player hit a damaged spot in a local file."""
+    entry = store.get(entry_id)
+    if not entry:
+        raise HttpError(404, "Entry not found")
+    at = int(float(body.get("at") or 0))
+    spots = sorted(set((entry.get("glitches") or []) + [at]))
+    patch = {"glitches": spots}
+    if body.get("fatal"):
+        patch.update({"damaged": True,
+                      "problem": "too damaged to play from %s" % downloader.fmt_clock(at)})
+    return {"entry": store.update(entry_id, patch)}
+
+
 def library_progress(entry_id, body):
     entry = store.update(entry_id, {
         "position": float(body.get("position") or 0),

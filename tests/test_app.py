@@ -774,3 +774,27 @@ class TestCompleteness(unittest.TestCase):
         subprocess.run([downloader.which_ffmpeg(), "-y", "-loglevel", "error", "-i", self.sample,
                         "-an", "-c", "copy", mute], check=True, timeout=60)
         self.assertEqual(downloader.completeness_problem(mute, 10), "the file has no sound")
+
+
+class TestDecodeCheck(unittest.TestCase):
+    """Garbage inside well-formed packets passes parsing; decoding catches it."""
+
+    def test_clean_file_decodes_without_errors(self):
+        if not downloader.which_ffmpeg():
+            self.skipTest("ffmpeg not available")
+        self.assertEqual(downloader.decode_errors(os.path.join(ROOT, "tools", "sample.mp4")), 0)
+
+    def test_damage_inside_packets_is_found(self):
+        if not downloader.which_ffmpeg():
+            self.skipTest("ffmpeg not available")
+        tmp = tempfile.mkdtemp(prefix="kp-decode-")
+        broken = os.path.join(tmp, "broken.mp4")
+        with open(os.path.join(ROOT, "tools", "sample.mp4"), "rb") as fh:
+            data = bytearray(fh.read())
+        # scribble over picture data but leave the container intact
+        for offset in range(len(data) // 3, len(data) * 2 // 3, 4096):
+            data[offset:offset + 64] = os.urandom(64)
+        with open(broken, "wb") as fh:
+            fh.write(data)
+        self.assertGreater(downloader.decode_errors(broken), 0)
+        shutil.rmtree(tmp, ignore_errors=True)
