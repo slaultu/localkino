@@ -266,3 +266,5 @@ select.btn { appearance: none; padding-right: 28px; background-image: linear-gra
 .player-info:hover { color: var(--text); }
 .inprogress h2 .bulk { margin-left: auto; display: flex; gap: 8px; }
 .inprogress h2 .bulk .btn { font-size: 12.5px; }
+.card.seen .poster img { opacity: .45; }
+.card.seen .card-title { color: var(--muted); }

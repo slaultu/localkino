@@ -270,6 +270,26 @@ def downloads_action(entry_id, action):
 # --------------------------------------------------------------------------- #
 # library
 # --------------------------------------------------------------------------- #
+def _mark_watched_from_history(entries):
+    """Add kino.pub's watched state (from the kept item copies) to each entry."""
+    items = {}
+    for entry in entries:
+        item_id = entry.get("item_id")
+        if not item_id:
+            continue
+        if item_id not in items:
+            cached = item_cache.load(item_id)
+            item = ((cached or {}).get("data") or {}).get("item") or {}
+            medias = list(item.get("videos") or [])
+            for season in item.get("seasons") or []:
+                medias.extend(season.get("episodes") or [])
+            items[item_id] = {str(m.get("id")): m for m in medias}
+        media = items[item_id].get(str(entry.get("media_id")))
+        if media is not None:
+            status = (media.get("watching") or {}).get("status")
+            entry["history_watched"] = str(media.get("watched")) == "1" or str(status) == "1"
+
+
 def library_list(_params, _body):
     entries = []
     for entry in store.all_entries():
@@ -280,6 +300,7 @@ def library_list(_params, _body):
         if entry["available"] and not entry.get("total_bytes"):
             entry["total_bytes"] = os.path.getsize(path)
         entries.append(entry)
+    _mark_watched_from_history(entries)
     entries.sort(key=lambda e: (e.get("show_title") or e.get("title") or "",
                                 e.get("season") or 0, e.get("episode") or 0))
     return {"entries": entries, "library_dir": config.get("library_dir")}

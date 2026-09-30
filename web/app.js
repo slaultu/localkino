@@ -259,7 +259,7 @@ function card(item, options) {
   img.addEventListener('error', () => { img.src = PLACEHOLDER; });
   const quality = item.quality ? qualityLabel(item.quality) : null;
   return el('div', {
-    class: 'card',
+    class: 'card' + (options.seen ? ' seen' : ''),
     onclick: options.onclick || (() => { location.hash = '#/item/' + item.id; }),
   },
     el('div', { class: 'poster' }, img,
@@ -1717,6 +1717,12 @@ function globalSpeedPicker() {
   }, choices.map(([value, label]) => el('option', { value, selected: value === current }, label)));
 }
 
+/* Watched on this Mac (played past 92%) or marked watched. */
+function isEntryWatched(entry) {
+  if (entry.watched || entry.history_watched) return true;   // here, or on kino.pub
+  return !!(entry.position && entry.duration && entry.position / entry.duration > 0.92);
+}
+
 /* How a saved file stands: checked complete, broken, or not checked yet. */
 function fileStatus(entry) {
   if (entry.available === false) {
@@ -1787,7 +1793,7 @@ function savedFileActions(entry, afterChange) {
       } catch (error) { toast(error.message, 'err'); }
     },
   }, '🗑');
-  return [verify, again, remove];
+  return [again, remove];             // files are checked automatically at startup
 }
 
 function showFilmSheet(entry) {
@@ -1800,7 +1806,8 @@ function showFilmSheet(entry) {
         [entry.quality, bytes(entry.total_bytes), entry.year].filter(Boolean).join(' · ')),
       el('div', { class: 'episodes' },
         el('div', { class: 'episode' },
-          el('span', { class: 'name' }, entry.damaged ? `Will not play: ${entry.problem || 'the file is damaged'}` : 'Saved on this Mac'),
+          el('span', { class: 'name' }, entry.damaged ? `Will not play: ${entry.problem || 'the file is damaged'}`
+            : isEntryWatched(entry) ? '✓ Watched' : entry.position > 30 ? `Stopped at ${duration(entry.position)}` : 'Not watched yet'),
           fileStatus(entry),
           entry.damaged ? null : el('button', {
             class: 'btn small primary', title: 'Play from disk',
@@ -1857,15 +1864,18 @@ async function viewLibrary(options) {
           badge: first.damaged ? '⚠ not playable' : first.quality,
           meta: bytes(first.total_bytes),
           progress: first.position && first.duration ? Math.min(first.position / first.duration, 1) : 0,
-          onclick: () => (first.damaged ? showFilmSheet(first) : playLibraryEntry(first)),
-          corner: { label: '⋯', title: 'Check, download again, delete', onclick: () => showFilmSheet(first) },
+          seen: isEntryWatched(first),
+          meta: [bytes(first.total_bytes), isEntryWatched(first) ? '✓ watched' : null].filter(Boolean).join(' · '),
+          onclick: () => showFilmSheet(first),
         }));
       } else {                                   // a series: opens its episode sheet
         blocks.push(card({ id: first.item_id, title: name, year: first.year, posters: poster }, {
           badge: list.some((e) => e.damaged)
             ? `⚠ ${list.filter((e) => e.damaged).length} not playable`
             : `${list.length} ${list.length === 1 ? 'ep' : 'eps'}`,
-          meta: bytes(list.reduce((sum, e) => sum + (e.total_bytes || 0), 0)),
+          meta: [bytes(list.reduce((sum, e) => sum + (e.total_bytes || 0), 0)),
+            `${list.filter(isEntryWatched).length}/${list.length} watched`].join(' · '),
+          seen: list.every(isEntryWatched),
           onclick: () => showLibraryGroup(name, list),
           corner: first.item_id ? {
             label: '↗', title: 'Open the series — all episodes',
@@ -1889,7 +1899,7 @@ async function viewLibrary(options) {
     }
 
     if (!quiet && navigator.onLine) {
-      const seriesIds = [...new Set(entries.concat(active).filter((e) => e.season && e.item_id).map((e) => e.item_id))];
+      const seriesIds = [...new Set(entries.concat(active).filter((e) => e.item_id).map((e) => e.item_id))];  // films too: watched history
       if (seriesIds.length) local.post('/cache/warm', { ids: seriesIds }).catch(() => {});
     }
 
@@ -1898,7 +1908,6 @@ async function viewLibrary(options) {
       el('p', { class: 'subtitle' }, summary),
       el('div', { class: 'actions', style: 'margin-top:0;margin-bottom:18px' },
         revealButton(null, '📂 Open folder'),
-        entries.length ? verifyButton(entries) : null,
         globalSpeedPicker()),
       damagedCount ? el('div', { class: 'banner err' },
         `⚠️ ${damagedCount} downloaded ${damagedCount === 1 ? 'file is' : 'files are'} damaged or incomplete and will not play properly — press ↻ on it to download again.`) : null,
@@ -1987,7 +1996,7 @@ function showLibraryGroup(name, list) {
     ];
   };
 
-  const savedRow = (entry) => el('div', { class: 'episode' },
+  const savedRow = (entry) => el('div', { class: 'episode' + (isEntryWatched(entry) ? ' seen' : '') },
     el('span', { class: 'num' }, entry.season ? `${entry.season}×${String(entry.episode).padStart(2, '0')}` : '▶︎'),
     el('span', { class: 'name' }, entry.episode_title || entry.title),
     savedControls(entry));
@@ -2001,7 +2010,8 @@ function showLibraryGroup(name, list) {
   if (!itemId) return renderSavedOnly();
 
   const isWatched = (media) => Number(media.watched) === 1
-    || Number((media.watching || {}).status) === 1;
+    || Number((media.watching || {}).status) === 1
+    || isEntryWatched(savedByMedia.get(String(media.media_id)) || {});
   let shown = null;                               // what the rows currently reflect
 
   // every season and episode, downloaded or not

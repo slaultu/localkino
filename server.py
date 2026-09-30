@@ -413,6 +413,10 @@ def main():
     if swept:
         print("  stopped %d ffmpeg process(es) left over from an earlier run" % swept, flush=True)
     downloader.start()
+    # check every saved file on startup (unchanged ones keep their verdict)
+    check = threading.Timer(15, lambda: downloader.verify_library(only_changed=True))
+    check.daemon = True                  # must never keep the server from exiting
+    check.start()
 
     port = free_port(args.port or int(config.get("port") or 8777))
     httpd = QuietServer(("127.0.0.1", port), Handler)

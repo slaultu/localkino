@@ -1088,11 +1088,20 @@ LOOKUP_SPACING = 4.0           # seconds between stream-length lookups during a 
 _verify_state = {"running": False, "checked": 0, "total": 0, "damaged": 0}
 
 
-def verify_library():
-    """Scan every finished download in the background and flag damaged ones."""
+def _needs_check(entry):
+    """Unchecked, or changed on disk since its last check."""
+    try:
+        return not entry.get("verified_at") or os.path.getmtime(human_path(entry)) > entry["verified_at"]
+    except OSError:
+        return False
+
+
+def verify_library(only_changed=False):
+    """Scan finished downloads in the background and flag damaged ones."""
     if _verify_state["running"]:
         return dict(_verify_state)
-    entries = [e for e in store.all_entries() if e.get("status") == "done"]
+    entries = [e for e in store.all_entries() if e.get("status") == "done"
+               and (not only_changed or _needs_check(e))]
     _verify_state.update({"running": True, "checked": 0, "total": len(entries), "damaged": 0})
 
     def scan():
